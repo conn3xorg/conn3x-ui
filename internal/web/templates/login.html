@@ -1,0 +1,13 @@
+{{define "title"}}Sign in{{end}}
+{{define "content"}}
+<h1>Sign in</h1>
+<form method="post" action="/login" style="max-width: 24rem">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label for="name">Name</label>
+  <input id="name" name="name" autocomplete="username" required autofocus>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <p><button class="primary">Sign in</button></p>
+  <small>First time? The admin password was printed to the log when conn3x-ui started.</small>
+</form>
+{{end}}

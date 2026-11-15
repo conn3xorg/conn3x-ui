@@ -1,0 +1,429 @@
+// Copyright (c) The Conn3x Authors
+// SPDX-License-Identifier: MPL-2.0
+
+// Package store keeps projects, runs, users and sessions in one SQLite file.
+package store
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/pbkdf2"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// ErrNotFound is a row that isn't there.
+var ErrNotFound = errors.New("not found")
+
+// migrations run in order; each entry is one schema version. Add to the
+// end, never edit an entry that shipped.
+var migrations = []string{
+	`CREATE TABLE users (
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	);
+	CREATE TABLE sessions (
+		token TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		csrf TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	);
+	CREATE TABLE projects (
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL UNIQUE,
+		git_url TEXT NOT NULL,
+		git_ref TEXT NOT NULL,
+		path TEXT NOT NULL,
+		conn3x_path TEXT NOT NULL,
+		env TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	CREATE TABLE runs (
+		id INTEGER PRIMARY KEY,
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		kind TEXT NOT NULL,
+		status TEXT NOT NULL,
+		commit_sha TEXT NOT NULL DEFAULT '',
+		conn3x_version TEXT NOT NULL DEFAULT '',
+		error TEXT NOT NULL DEFAULT '',
+		created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+		created_at TEXT NOT NULL,
+		started_at TEXT,
+		finished_at TEXT
+	);
+	CREATE INDEX runs_project ON runs(project_id, id);
+	CREATE TABLE run_events (
+		run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+		seq INTEGER NOT NULL,
+		line BLOB NOT NULL,
+		PRIMARY KEY (run_id, seq)
+	);`,
+}
+
+// Store is the database.
+type Store struct {
+	db *sql.DB
+}
+
+// Open opens or creates the database at path and brings its schema up to
+// date.
+func Open(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	// One connection: SQLite serialises writers anyway, and this keeps a
+	// write from ever seeing SQLITE_BUSY from our own reads.
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) migrate() error {
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	for i := version; i < len(migrations); i++ {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(migrations[i]); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration %d: %w", i+1, err)
+		}
+		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Close closes the database.
+func (s *Store) Close() error { return s.db.Close() }
+
+func now() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// Project is a Git repo and a path in it that Conn3x runs from.
+type Project struct {
+	ID         int64
+	Name       string
+	GitURL     string
+	GitRef     string
+	Path       string
+	Conn3xPath string
+	// Env is KEY=VALUE lines the runs get.
+	// shortcut: stored in plain text; #891 encrypts credentials with a key
+	// the UI reads at start.
+	Env       string
+	CreatedAt string
+	UpdatedAt string
+}
+
+// EnvList is Env as the []string os/exec wants, blank lines dropped.
+func (p Project) EnvList() []string {
+	var out []string
+	for _, l := range strings.Split(p.Env, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, created_at, updated_at"
+
+func scanProject(row interface{ Scan(...any) error }) (Project, error) {
+	var p Project
+	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrNotFound
+	}
+	return p, err
+}
+
+// CreateProject adds p and returns its ID.
+func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
+	t := now()
+	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, t, t)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// UpdateProject saves p's fields over the project with p.ID.
+func (s *Store) UpdateProject(ctx context.Context, p Project) error {
+	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, updated_at=? WHERE id=?",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, now(), p.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteProject removes a project and its runs.
+func (s *Store) DeleteProject(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, "DELETE FROM projects WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Project returns one project.
+func (s *Store) Project(ctx context.Context, id int64) (Project, error) {
+	return scanProject(s.db.QueryRowContext(ctx, "SELECT "+projectCols+" FROM projects WHERE id=?", id))
+}
+
+// Projects returns every project, by name.
+func (s *Store) Projects(ctx context.Context) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT "+projectCols+" FROM projects ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Project
+	for rows.Next() {
+		p, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// Run statuses. Queued waits for the project's lock; the rest follow.
+const (
+	StatusQueued    = "queued"
+	StatusRunning   = "running"
+	StatusSucceeded = "succeeded"
+	StatusFailed    = "failed"
+)
+
+// Run is one conn3x run. Kind is "plan" for now; #889 adds "apply".
+type Run struct {
+	ID            int64
+	ProjectID     int64
+	Kind          string
+	Status        string
+	CommitSHA     string
+	Conn3xVersion string
+	Error         string
+	CreatedBy     sql.NullInt64
+	CreatedAt     string
+	StartedAt     sql.NullString
+	FinishedAt    sql.NullString
+}
+
+// Finished is true once the run has a final status.
+func (r Run) Finished() bool { return r.Status == StatusSucceeded || r.Status == StatusFailed }
+
+const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, created_at, started_at, finished_at"
+
+func scanRun(row interface{ Scan(...any) error }) (Run, error) {
+	var r Run
+	err := row.Scan(&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedAt, &r.StartedAt, &r.FinishedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrNotFound
+	}
+	return r, err
+}
+
+// CreateRun adds a queued run and returns its ID.
+func (s *Store) CreateRun(ctx context.Context, projectID int64, kind string, userID int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+		projectID, kind, StatusQueued, userID, now())
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// StartRun marks a run running.
+func (s *Store) StartRun(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE runs SET status=?, started_at=? WHERE id=?", StatusRunning, now(), id)
+	return err
+}
+
+// SetRunCommit records what the run checked out.
+func (s *Store) SetRunCommit(ctx context.Context, id int64, sha string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE runs SET commit_sha=? WHERE id=?", sha, id)
+	return err
+}
+
+// SetRunVersion records the Conn3x release from the version event.
+func (s *Store) SetRunVersion(ctx context.Context, id int64, version string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE runs SET conn3x_version=? WHERE id=?", version, id)
+	return err
+}
+
+// FinishRun records the final status. errMsg is empty on success.
+func (s *Store) FinishRun(ctx context.Context, id int64, status, errMsg string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE runs SET status=?, error=?, finished_at=? WHERE id=?", status, errMsg, now(), id)
+	return err
+}
+
+// Run returns one run.
+func (s *Store) Run(ctx context.Context, id int64) (Run, error) {
+	return scanRun(s.db.QueryRowContext(ctx, "SELECT "+runCols+" FROM runs WHERE id=?", id))
+}
+
+// Runs returns a project's runs, newest first.
+func (s *Store) Runs(ctx context.Context, projectID int64) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT "+runCols+" FROM runs WHERE project_id=? ORDER BY id DESC", projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AppendEvent stores one raw line of a run's stream and returns its seq,
+// counting from 1.
+func (s *Store) AppendEvent(ctx context.Context, runID int64, line []byte) (int64, error) {
+	var seq int64
+	err := s.db.QueryRowContext(ctx,
+		"INSERT INTO run_events (run_id, seq, line) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?), ?) RETURNING seq",
+		runID, runID, line).Scan(&seq)
+	return seq, err
+}
+
+// Events returns a run's raw lines in order, with the seq of the last.
+func (s *Store) Events(ctx context.Context, runID int64) ([][]byte, int64, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT seq, line FROM run_events WHERE run_id=? ORDER BY seq", runID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out [][]byte
+	var last int64
+	for rows.Next() {
+		var line []byte
+		if err := rows.Scan(&last, &line); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, line)
+	}
+	return out, last, rows.Err()
+}
+
+// User is someone who can sign in.
+// shortcut: local accounts only, one admin made at first start; #892 brings
+// OIDC and roles.
+type User struct {
+	ID   int64
+	Name string
+}
+
+// Token returns n random bytes as hex.
+func Token(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+const pbkdf2Rounds = 600_000
+
+func hashPassword(password, salt string) string {
+	key, err := pbkdf2.Key(sha256.New, password, []byte(salt), pbkdf2Rounds, 32)
+	if err != nil {
+		panic(err)
+	}
+	return "pbkdf2-sha256$" + salt + "$" + hex.EncodeToString(key)
+}
+
+// CreateUser adds a user with a password.
+func (s *Store) CreateUser(ctx context.Context, name, password string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, "INSERT INTO users (name, password_hash, created_at) VALUES (?, ?, ?)",
+		name, hashPassword(password, Token(16)), now())
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// UserCount says how many users exist, so the first start can make one.
+func (s *Store) UserCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&n)
+	return n, err
+}
+
+// Login checks a password and, when it's right, opens a session. It
+// returns the session token and its CSRF token.
+func (s *Store) Login(ctx context.Context, name, password string, ttl time.Duration) (token, csrf string, err error) {
+	var id int64
+	var hash string
+	err = s.db.QueryRowContext(ctx, "SELECT id, password_hash FROM users WHERE name=?", name).Scan(&id, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Hash anyway, so a missing user takes as long as a wrong password.
+		hashPassword(password, "x")
+		return "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	parts := strings.Split(hash, "$")
+	if len(parts) != 3 || !hmac.Equal([]byte(hashPassword(password, parts[1])), []byte(hash)) {
+		return "", "", ErrNotFound
+	}
+	token, csrf = Token(32), Token(32)
+	_, err = s.db.ExecContext(ctx, "INSERT INTO sessions (token, user_id, csrf, expires_at) VALUES (?, ?, ?, ?)",
+		token, id, csrf, time.Now().UTC().Add(ttl).Format(time.RFC3339))
+	return token, csrf, err
+}
+
+// Session returns the user and CSRF token of a live session.
+func (s *Store) Session(ctx context.Context, token string) (User, string, error) {
+	var u User
+	var csrf string
+	err := s.db.QueryRowContext(ctx, "SELECT u.id, u.name, s.csrf FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=? AND s.expires_at > ?",
+		token, now()).Scan(&u.ID, &u.Name, &csrf)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrNotFound
+	}
+	return u, csrf, err
+}
+
+// Logout ends a session.
+func (s *Store) Logout(ctx context.Context, token string) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE token=?", token)
+	return err
+}

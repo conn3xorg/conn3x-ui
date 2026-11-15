@@ -1,0 +1,25 @@
+{{define "title"}}Projects{{end}}
+{{define "content"}}
+<div class="cols">
+<section>
+  <h1>Projects</h1>
+  {{if .Data.Projects}}
+  <table>
+    <tr><th>Name</th><th>Repository</th><th>Ref</th></tr>
+    {{range .Data.Projects}}
+    <tr><td><a href="/projects/{{.ID}}">{{.Name}}</a></td><td>{{.GitURL}}</td><td>{{.GitRef}}</td></tr>
+    {{end}}
+  </table>
+  {{else}}
+  <p>No projects yet. A project is a Git repository with circuits in it. Add one and press Plan to see what Conn3x would change.</p>
+  {{end}}
+</section>
+<section>
+  <h2>New project</h2>
+  <form method="post" action="/projects">
+    {{template "project_form" .}}
+    <p><button class="primary">Create project</button></p>
+  </form>
+</section>
+</div>
+{{end}}

@@ -1,0 +1,5 @@
+data/
+*.db
+*.db-shm
+*.db-wal
+conn3x-ui

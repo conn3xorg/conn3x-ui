@@ -1,0 +1,18 @@
+{{define "project_form"}}
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<label for="name">Name</label>
+<input id="name" name="name" value="{{.Data.Form.Name}}" required>
+<label for="git_url">Git URL</label>
+<input id="git_url" name="git_url" value="{{.Data.Form.GitURL}}" placeholder="https://github.com/you/circuits.git" required>
+<small>https://, ssh:// or git@host:repo. The UI's host needs to be able to reach it without a prompt.</small>
+<label for="git_ref">Branch or tag</label>
+<input id="git_ref" name="git_ref" value="{{.Data.Form.GitRef}}">
+<label for="path">Path in the repository</label>
+<input id="path" name="path" value="{{.Data.Form.Path}}">
+<label for="conn3x_path">Conn3x binary</label>
+<input id="conn3x_path" name="conn3x_path" value="{{.Data.Form.Conn3xPath}}">
+<small>A path on the UI's host, or <code>conn3x</code> for the one on PATH. Each project can pin its own.</small>
+<label for="env">Environment variables</label>
+<textarea id="env" name="env" placeholder="AWS_PROFILE=prod&#10;TF_VAR_region=eu-west-1">{{.Data.Form.Env}}</textarea>
+<small>One NAME=value per line. Stored in plain text for now; encrypted secrets are coming.</small>
+{{end}}

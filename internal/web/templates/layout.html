@@ -1,0 +1,42 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{template "title" .}} · Conn3x</title>
+<style>
+  :root { color-scheme: light dark; --muted: #6b7280; --line: #d1d5db; --ok: #15803d; --bad: #b91c1c; --warn: #b45309; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; max-width: 64rem; padding: 0 1rem 3rem; margin-inline: auto; }
+  header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid var(--line); margin-bottom: 1.5rem; }
+  header a { font-weight: 600; text-decoration: none; color: inherit; }
+  header form { display: inline; margin-left: .75rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 1rem; } h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; } h3 { font-size: 1rem; margin: 1rem 0 .25rem; }
+  label { display: block; margin: .75rem 0 .2rem; font-weight: 500; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: .4rem .5rem; font: inherit; border: 1px solid var(--line); border-radius: 4px; }
+  textarea { font-family: ui-monospace, monospace; min-height: 5rem; }
+  small { color: var(--muted); }
+  button { font: inherit; padding: .4rem .9rem; border-radius: 4px; border: 1px solid var(--line); background: #e5e7eb; color: #111; cursor: pointer; }
+  button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+  button.danger { background: transparent; color: var(--bad); }
+  table { border-collapse: collapse; width: 100%; } th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .error { color: var(--bad); border: 1px solid var(--bad); padding: .5rem .75rem; border-radius: 4px; white-space: pre-wrap; }
+  .status { font-weight: 600; } .succeeded { color: var(--ok); } .failed { color: var(--bad); } .running, .queued { color: var(--warn); }
+  pre { background: #111; color: #e5e7eb; padding: .75rem; border-radius: 4px; overflow: auto; max-height: 28rem; font-size: 13px; white-space: pre-wrap; }
+  .act { font-family: ui-monospace, monospace; }
+  .cols { display: grid; gap: 2rem; grid-template-columns: 1fr 1fr; } @media (max-width: 48rem) { .cols { grid-template-columns: 1fr; } }
+</style>
+<script src="/static/htmx.min.js"></script>
+</head>
+<body>
+<header>
+  <a href="/">Conn3x</a>
+  {{if .User.Name}}<span><small>{{.User.Name}}</small>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Sign out</button></form></span>{{end}}
+</header>
+<main>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>
+{{end}}

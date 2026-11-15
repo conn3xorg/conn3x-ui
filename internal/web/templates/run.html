@@ -1,0 +1,47 @@
+{{define "title"}}Run {{.Data.Run.ID}} · {{.Data.Project.Name}}{{end}}
+{{define "content"}}
+<h1>Plan {{.Data.Run.ID}} · <a href="/projects/{{.Data.Project.ID}}">{{.Data.Project.Name}}</a></h1>
+{{template "status" .}}
+<h2>Output</h2>
+<pre id="log">{{range .Data.Lines}}{{lineText .}}
+{{end}}</pre>
+{{if not .Data.Run.Finished}}
+<script>
+  const log = document.getElementById("log");
+  const es = new EventSource("/runs/{{.Data.Run.ID}}/events?after={{.Data.Last}}");
+  es.onmessage = e => { log.append(e.data + "\n"); log.scrollTop = log.scrollHeight; };
+  es.addEventListener("done", () => { es.close(); htmx.trigger("#status", "refresh"); });
+</script>
+{{end}}
+{{end}}
+
+{{define "status"}}
+<div id="status" {{if not .Data.Run.Finished}}hx-get="/runs/{{.Data.Run.ID}}/status" hx-trigger="every 2s, refresh" hx-swap="outerHTML"{{end}}>
+  <p>
+    <span class="status {{.Data.Run.Status}}">{{.Data.Run.Status}}</span>
+    {{if .Data.Run.CommitSHA}} · commit <span class="act">{{printf "%.10s" .Data.Run.CommitSHA}}</span>{{end}}
+    {{if .Data.Run.Conn3xVersion}} · Conn3x {{.Data.Run.Conn3xVersion}}{{end}}
+    {{if .Data.Run.StartedAt.Valid}} · started {{.Data.Run.StartedAt.String}}{{end}}
+    {{if .Data.Run.FinishedAt.Valid}} · finished {{.Data.Run.FinishedAt.String}}{{end}}
+  </p>
+  {{if .Data.Run.Error}}<p class="error">{{.Data.Run.Error}}</p>{{end}}
+  {{with .Data.Result}}
+    {{with .Summary}}<p><strong>Plan:</strong> {{.Add}} to add, {{.Change}} to change, {{.Remove}} to destroy{{if .Import}}, {{.Import}} to import{{end}}.</p>{{end}}
+    {{range .Diagnostics}}<p class="error">{{.Severity}}: {{.Summary}}{{if .Detail}}
+{{.Detail}}{{end}}</p>{{end}}
+    {{range .Hosts}}
+    <h3>{{if .Name}}{{.Name}}{{else}}Other resources{{end}}</h3>
+    <table>
+      {{range .Steps}}{{$step := .Name}}{{range .Actions}}
+      <tr><td class="act">{{$step}}{{if .Item}}[{{.Item}}]{{end}}</td><td class="act">{{.Action}}</td><td><small>{{.Reason}}</small></td></tr>
+      {{end}}{{end}}
+    </table>
+    {{end}}
+    {{if .Drift}}
+    <h3>Drift since the last apply</h3>
+    <table>{{range .Drift}}<tr><td class="act">{{.Addr}}</td><td class="act">{{.Action}}</td></tr>{{end}}</table>
+    {{end}}
+    {{if and (not .Hosts) (not .Diagnostics) (eq $.Data.Run.Status "succeeded")}}<p>No changes. Every host already matches its circuits.</p>{{end}}
+  {{end}}
+</div>
+{{end}}
