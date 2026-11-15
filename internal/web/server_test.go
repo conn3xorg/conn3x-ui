@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -32,22 +33,41 @@ func changeLine(host, step, action string) string {
 	return fmt.Sprintf(`{"@level":"info","@message":"planned","type":"planned_change","change":{"resource":{"addr":"conn3x_command.box__%s[\"%s\"]","resource_type":"conn3x_command","resource_name":"box__%s","conn3x":{"circuit":"box","step":"%s","host":"%s"}},"action":"%s"}}`, step, host, step, step, host, action)
 }
 
+func hookLine(typ, host, step, action string, elapsed float64) string {
+	return fmt.Sprintf(`{"@level":"info","@message":"%s %s","type":"%s","hook":{"resource":{"addr":"conn3x_command.box__%s[\"%s\"]","resource_type":"conn3x_command","resource_name":"box__%s","conn3x":{"circuit":"box","step":"%s","host":"%s"}},"action":"%s","elapsed_seconds":%g}}`, host, step, typ, step, host, step, step, host, action, elapsed)
+}
+
+// waitForInterrupt blocks until SIGINT, as conn3x does mid-step, then
+// exits 1 the way an interrupted conn3x does.
+func waitForInterrupt(ch chan os.Signal) {
+	<-ch
+	fmt.Println(`{"@level":"error","@message":"Error: Interrupted","type":"diagnostic","diagnostic":{"severity":"error","summary":"Interrupted","detail":"the run was stopped"}}`)
+	os.Exit(1)
+}
+
 // TestMain lets the test binary stand in for conn3x. CONN3X_FAKE, which
 // reaches it through the project's environment, picks what it does:
-// "plan" configures an http backend, "local" leaves state local.
+// "plan" configures an http backend and plans and applies, "local" leaves
+// state local, "stale" refuses the apply the way a stale plan is refused,
+// "hang" makes the plan wait for an interrupt.
 func TestMain(m *testing.M) {
 	mode := os.Getenv("CONN3X_FAKE")
 	if mode == "" {
 		os.Exit(m.Run())
 	}
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt) // before the version line, so a test that sees it can cancel
 	fmt.Println(versionLine)
 	switch os.Args[1] {
 	case "init":
-		if mode == "plan" {
+		if mode != "local" {
 			os.MkdirAll(".terraform", 0o755)
 			os.WriteFile(".terraform/terraform.tfstate", []byte(`{"version":3,"backend":{"type":"http"}}`), 0o644)
 		}
 	case "plan":
+		if mode == "hang" {
+			waitForInterrupt(interrupt)
+		}
 		fmt.Println(changeLine("web2", "build", "create"))
 		fmt.Println(changeLine("web1", "build", "update"))
 		fmt.Println(changeLine("web1", "deploy", "create"))
@@ -57,6 +77,23 @@ func TestMain(m *testing.M) {
 				os.WriteFile(out, []byte("plan"), 0o644)
 			}
 		}
+	case "apply":
+		if b, err := os.ReadFile(os.Args[len(os.Args)-1]); err != nil || string(b) != "plan" {
+			fmt.Printf(`{"@level":"error","@message":"Error: no plan file","type":"diagnostic","diagnostic":{"severity":"error","summary":"no plan file","detail":%q}}`+"\n", fmt.Sprint(os.Args, err))
+			os.Exit(1)
+		}
+		if mode == "stale" {
+			fmt.Println(`{"@level":"error","@message":"Error: Saved plan is stale","type":"diagnostic","diagnostic":{"severity":"error","summary":"Saved plan is stale","detail":"The given plan file can no longer be applied because the state was changed by another operation after the plan was created."}}`)
+			os.Exit(1)
+		}
+		// The checkout's marker says which commit the apply really ran on.
+		marker, _ := os.ReadFile("marker.txt")
+		fmt.Printf(`{"@level":"info","@message":"marker %s","type":"conn3x_fake"}`+"\n", strings.TrimSpace(string(marker)))
+		fmt.Println(hookLine("apply_start", "web2", "build", "create", 0))
+		fmt.Println(hookLine("apply_complete", "web2", "build", "create", 1.5))
+		fmt.Println(hookLine("apply_complete", "web1", "build", "update", 0.5))
+		fmt.Println(hookLine("apply_errored", "web1", "deploy", "create", 2))
+		fmt.Println(`{"type":"change_summary","@message":"Apply complete! Resources: 1 added, 1 changed, 0 destroyed.","changes":{"add":1,"change":1,"remove":0,"operation":"apply"}}`)
 	}
 }
 
@@ -86,6 +123,7 @@ func gitServer(t *testing.T, files map[string]string) (string, string) {
 	sha := git(t, work, "rev-parse", "HEAD")
 	root := t.TempDir()
 	git(t, work, "clone", "-q", "--bare", work, filepath.Join(root, "repo.git"))
+	git(t, filepath.Join(root, "repo.git"), "config", "http.receivepack", "true") // so a test can push a second commit
 	execPath, err := exec.Command("git", "--exec-path").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -96,6 +134,21 @@ func gitServer(t *testing.T, files map[string]string) (string, string) {
 	})
 	t.Cleanup(srv.Close)
 	return srv.URL + "/repo.git", sha
+}
+
+// commit adds files to the served repo's main as a new commit and returns
+// its SHA.
+func commit(t *testing.T, repoURL string, files map[string]string) string {
+	t.Helper()
+	work := filepath.Join(t.TempDir(), "work2")
+	git(t, t.TempDir(), "clone", "-q", repoURL, work)
+	for name, body := range files {
+		os.WriteFile(filepath.Join(work, name), []byte(body), 0o644)
+	}
+	git(t, work, "add", ".")
+	git(t, work, "commit", "-q", "-m", "more")
+	git(t, work, "push", "-q", "origin", "main")
+	return git(t, work, "rev-parse", "HEAD")
 }
 
 type client struct {
@@ -162,30 +215,62 @@ func (c *client) createProject(t *testing.T, name, gitURL, path, conn3x, env str
 // plan starts a plan and reads its event stream to the done event.
 func (c *client) plan(t *testing.T, projectPath string) (runPath string, events []string) {
 	t.Helper()
-	resp := c.post(projectPath+"/plan", url.Values{"csrf": {c.csrf(projectPath)}})
+	return c.follow(t, projectPath+"/plan")
+}
+
+// apply applies a plan run and reads the apply's stream to the done event.
+func (c *client) apply(t *testing.T, planPath string) (runPath string, events []string) {
+	t.Helper()
+	return c.follow(t, planPath+"/apply")
+}
+
+// follow posts to a path that starts a run and reads the run's event
+// stream to the done event.
+func (c *client) follow(t *testing.T, startPath string) (runPath string, events []string) {
+	t.Helper()
+	runPath, es := c.start(t, startPath)
+	defer es.Body.Close()
+	sc := bufio.NewScanner(es.Body)
+	events, done := readEvents(sc, nil)
+	if !done {
+		t.Fatalf("stream ended without done: %v", sc.Err())
+	}
+	return runPath, events
+}
+
+// start posts to a path that starts a run and opens the run's stream.
+func (c *client) start(t *testing.T, startPath string) (runPath string, es *http.Response) {
+	t.Helper()
+	resp := c.post(startPath, url.Values{"csrf": {c.csrf("/")}})
 	runPath = resp.Header.Get("Location")
 	if resp.StatusCode != 303 || !strings.HasPrefix(runPath, "/runs/") {
-		t.Fatalf("plan: %d %s", resp.StatusCode, runPath)
+		t.Fatalf("%s: %d %s", startPath, resp.StatusCode, runPath)
 	}
 	es, err := c.Get(c.base + runPath + "/events")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer es.Body.Close()
 	if ct := es.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Fatalf("events content-type %q", ct)
 	}
-	sc := bufio.NewScanner(es.Body)
+	return runPath, es
+}
+
+// readEvents reads data lines until the done event, or until one matches
+// until. It says whether done was reached.
+func readEvents(sc *bufio.Scanner, until func(string) bool) (events []string, done bool) {
 	for sc.Scan() {
 		if sc.Text() == "event: done" {
-			return runPath, events
+			return events, true
 		}
 		if data, ok := strings.CutPrefix(sc.Text(), "data: "); ok {
 			events = append(events, data)
+			if until != nil && until(data) {
+				return events, false
+			}
 		}
 	}
-	t.Fatalf("stream ended without done: %v", sc.Err())
-	return
+	return events, false
 }
 
 type env struct {
@@ -270,6 +355,122 @@ func TestPlanFromBrowser(t *testing.T) {
 	}
 }
 
+func TestApplyFromBrowser(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, sha1 := gitServer(t, map[string]string{"circuits/main.tf": "# circuits\n", "circuits/marker.txt": "one\n"})
+	e.login(t)
+	project := e.createProject(t, "web", repo, "circuits", exe, "CONN3X_FAKE=plan\n")
+
+	// A finished plan with changes offers Apply.
+	planPath, _ := e.plan(t, project)
+	if _, body := e.get(planPath); !strings.Contains(body, `action="`+planPath+`/apply"`) || strings.Contains(body, "/cancel") {
+		t.Errorf("plan page:\n%s", body)
+	}
+
+	// The branch moves on; the apply still runs the plan's commit.
+	sha2 := commit(t, repo, map[string]string{"circuits/marker.txt": "two\n"})
+	applyPath, events := e.apply(t, planPath)
+	joined := strings.Join(events, "\n")
+	for _, want := range []string{"git fetch --depth 1 origin " + sha1, "at commit " + sha1, "marker one", "conn3x apply -input=false plan.bin (plan 1)", "web2 build", "Apply complete"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("apply events lack %q:\n%s", want, joined)
+		}
+	}
+	rn, _ := e.st.Run(context.Background(), 2)
+	if rn.Kind != "apply" || rn.Status != store.StatusSucceeded || rn.CommitSHA != sha1 || rn.CommitSHA == sha2 || rn.PlanRunID.Int64 != 1 || !rn.ApprovedAt.Valid || rn.ApprovedByName.String != "admin" {
+		t.Errorf("apply run %+v", rn)
+	}
+	_, body := e.get(applyPath)
+	for _, want := range []string{"<h1>Apply 2", `class="status succeeded"`, `<a href="/runs/1">plan 1</a>`, "approved by admin", "<h3>web1</h3>", "<h3>web2</h3>",
+		`<span class="succeeded">ok</span> <small>1.5s</small>`, `<span class="failed">failed</span> <small>2.0s</small>`, "<strong>Apply:</strong> 1 added, 1 changed, 0 destroyed."} {
+		if !strings.Contains(body, want) {
+			t.Errorf("apply page lacks %q", want)
+		}
+	}
+	if strings.Contains(body, "/apply\"") || strings.Contains(body, "No changes") {
+		t.Errorf("apply page offers Apply or says no changes:\n%s", body)
+	}
+
+	// Applied once, the plan can't be applied again.
+	if _, body := e.get(planPath); strings.Contains(body, "/apply\"") {
+		t.Error("applied plan still offers Apply")
+	}
+	if resp := e.post(planPath+"/apply", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
+		t.Errorf("second apply: %d", resp.StatusCode)
+	}
+
+	// A newer plan retires an older one.
+	plan3, _ := e.plan(t, project)
+	plan4, _ := e.plan(t, project)
+	if resp := e.post(plan3+"/apply", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
+		t.Errorf("apply of a superseded plan: %d", resp.StatusCode)
+	}
+	if _, body := e.get(plan3); strings.Contains(body, "/apply\"") {
+		t.Error("superseded plan still offers Apply")
+	}
+	if _, body := e.get(plan4); !strings.Contains(body, `action="`+plan4+`/apply"`) {
+		t.Error("newest plan doesn't offer Apply")
+	}
+	if resp := e.post(plan4+"/apply", url.Values{}); resp.StatusCode != 403 {
+		t.Errorf("apply without CSRF: %d", resp.StatusCode)
+	}
+	if _, body := e.get(project); !strings.Contains(body, "<td>apply of 1</td>") {
+		t.Errorf("project page lacks the apply:\n%s", body)
+	}
+}
+
+func TestStalePlanRefused(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	e.login(t)
+	planPath, _ := e.plan(t, e.createProject(t, "web", repo, ".", exe, "CONN3X_FAKE=stale"))
+	applyPath, events := e.apply(t, planPath)
+	if _, body := e.get(applyPath); !strings.Contains(body, `class="status failed"`) || !strings.Contains(body, "Saved plan is stale") || !strings.Contains(body, "state was changed by another operation") {
+		t.Errorf("apply page:\n%s\n%s", body, strings.Join(events, "\n"))
+	}
+}
+
+func TestCancel(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	e.login(t)
+	project := e.createProject(t, "web", repo, ".", exe, "CONN3X_FAKE=hang")
+	runPath, es := e.start(t, project+"/plan")
+	defer es.Body.Close()
+	sc := bufio.NewScanner(es.Body)
+	versions := 0 // init prints one, then the hanging plan prints one
+	if _, done := readEvents(sc, func(s string) bool { versions += strings.Count(s, "Conn3x v0.21.0"); return versions == 2 }); done {
+		t.Fatal("plan finished on its own")
+	}
+	if _, body := e.get(runPath); !strings.Contains(body, `action="`+runPath+`/cancel"`) {
+		t.Errorf("running plan has no Cancel:\n%s", body)
+	}
+	if resp := e.post(runPath+"/cancel", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 303 {
+		t.Errorf("cancel: %d", resp.StatusCode)
+	}
+	events, done := readEvents(sc, nil)
+	if !done {
+		t.Fatalf("stream ended without done: %v", sc.Err())
+	}
+	rn, _ := e.st.Run(context.Background(), 1)
+	if rn.Status != store.StatusCancelled || !rn.Finished() {
+		t.Errorf("run %+v\n%s", rn, strings.Join(events, "\n"))
+	}
+	joined := strings.Join(events, "\n")
+	if !strings.Contains(joined, "Interrupted") || !strings.Contains(joined, "Cancelled") {
+		t.Errorf("events:\n%s", joined)
+	}
+	if _, body := e.get(runPath); !strings.Contains(body, `class="status cancelled"`) || strings.Contains(body, "/cancel\"") {
+		t.Errorf("cancelled page:\n%s", body)
+	}
+	if resp := e.post(runPath+"/cancel", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
+		t.Errorf("cancel of a finished run: %d", resp.StatusCode)
+	}
+}
+
 func TestLocalStateRefused(t *testing.T) {
 	e := setup(t)
 	exe, _ := os.Executable()
@@ -320,7 +521,7 @@ func TestRealConn3x(t *testing.T) {
 	}))
 	defer stateSrv.Close()
 	repo, _ := gitServer(t, map[string]string{
-		"remote/main.tf": fmt.Sprintf("terraform {\n  backend \"http\" {\n    address = %q\n  }\n}\noutput \"hello\" { value = \"world\" }\n", stateSrv.URL+"/state"),
+		"remote/main.tf": fmt.Sprintf("terraform {\n  backend \"http\" {\n    address = %q\n  }\n}\nresource \"terraform_data\" \"hello\" { input = \"world\" }\n", stateSrv.URL+"/state"),
 		"local/main.tf":  "output \"hello\" { value = \"world\" }\n",
 	})
 	e := setup(t)
@@ -331,15 +532,29 @@ func TestRealConn3x(t *testing.T) {
 	if rn.Status != store.StatusSucceeded || rn.Conn3xVersion == "" {
 		t.Errorf("remote run %+v:\n%s", rn, strings.Join(events, "\n"))
 	}
-	if _, body := e.get(runPath); !strings.Contains(body, "No changes") && !strings.Contains(body, "0 to add") {
+	if _, body := e.get(runPath); !strings.Contains(body, "1 to add") || !strings.Contains(body, `action="`+runPath+`/apply"`) {
 		t.Errorf("run page:\n%s", body)
 	}
 	if _, err := os.Stat(e.runner.PlanFile(1)); err != nil {
 		t.Error(err)
 	}
+	applyPath, events := e.apply(t, runPath)
+	rn, _ = e.st.Run(context.Background(), 2)
+	if rn.Status != store.StatusSucceeded || rn.PlanRunID.Int64 != 1 {
+		t.Errorf("apply run %+v:\n%s", rn, strings.Join(events, "\n"))
+	}
+	if _, body := e.get(applyPath); !strings.Contains(body, "1 added") || !strings.Contains(body, `<span class="succeeded">ok</span>`) {
+		t.Errorf("apply page:\n%s", body)
+	}
+	if state == nil {
+		t.Error("the apply wrote no state")
+	}
+	if resp := e.post(runPath+"/apply", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
+		t.Errorf("second apply: %d", resp.StatusCode)
+	}
 
 	_, events = e.plan(t, e.createProject(t, "local", repo, "local", bin, ""))
-	rn, _ = e.st.Run(context.Background(), 2)
+	rn, _ = e.st.Run(context.Background(), 3)
 	if rn.Status != store.StatusFailed || !strings.Contains(rn.Error, "remote backend") {
 		t.Errorf("local run %+v:\n%s", rn, strings.Join(events, "\n"))
 	}

@@ -94,6 +94,54 @@ func TestRunsAndEvents(t *testing.T) {
 	}
 }
 
+func TestApplyRuns(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	pid, _ := s.CreateProject(ctx, Project{Name: "p"})
+	uid, _ := s.CreateUser(ctx, "admin", "pw")
+	plan, _ := s.CreateRun(ctx, pid, KindPlan, uid)
+	if ok, _ := s.Applicable(ctx, plan); ok {
+		t.Error("a queued plan is applicable")
+	}
+	if _, err := s.CreateApply(ctx, plan, uid); !errors.Is(err, ErrNotApplicable) {
+		t.Errorf("apply of a queued plan: %v", err)
+	}
+	s.FinishRun(ctx, plan, StatusSucceeded, "")
+	if ok, err := s.Applicable(ctx, plan); !ok || err != nil {
+		t.Errorf("succeeded plan not applicable: %v", err)
+	}
+	id, err := s.CreateApply(ctx, plan, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := s.Run(ctx, id)
+	if r.Kind != KindApply || r.Status != StatusQueued || r.ProjectID != pid || r.PlanRunID.Int64 != plan || r.ApprovedBy.Int64 != uid || r.ApprovedByName.String != "admin" || !r.ApprovedAt.Valid || r.CreatedBy.Int64 != uid {
+		t.Fatalf("%+v", r)
+	}
+	if _, err := s.CreateApply(ctx, plan, uid); !errors.Is(err, ErrNotApplicable) {
+		t.Errorf("second apply: %v", err)
+	}
+	if ok, _ := s.Applicable(ctx, plan); ok {
+		t.Error("an applied plan is applicable")
+	}
+	if _, err := s.CreateApply(ctx, id, uid); !errors.Is(err, ErrNotApplicable) {
+		t.Errorf("apply of an apply: %v", err)
+	}
+	plan2, _ := s.CreateRun(ctx, pid, KindPlan, uid)
+	s.FinishRun(ctx, plan2, StatusSucceeded, "")
+	s.CreateRun(ctx, pid, KindPlan, uid) // newer, still queued
+	if ok, _ := s.Applicable(ctx, plan2); ok {
+		t.Error("a superseded plan is applicable")
+	}
+	s.FinishRun(ctx, id, StatusCancelled, "")
+	if r, _ = s.Run(ctx, id); !r.Finished() || r.Status != StatusCancelled {
+		t.Errorf("%+v", r)
+	}
+	if runs, _ := s.Runs(ctx, pid); len(runs) != 4 || runs[0].Kind != KindPlan || runs[2].Kind != KindApply {
+		t.Errorf("%+v", runs)
+	}
+}
+
 func TestSessions(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()

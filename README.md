@@ -1,10 +1,10 @@
 # conn3x-ui
 
-A web UI for [Conn3x](https://conn3x.org). You point it at a Git repository with circuits in it, press Plan, and it shows you what would change on each host, step by step, while Conn3x is still working it out.
+A web UI for [Conn3x](https://conn3x.org). You point it at a Git repository with circuits in it, press Plan, and it shows you what would change on each host, step by step, while Conn3x is still working it out. Press Apply, and exactly that plan runs.
 
 It's one binary. It runs the `conn3x` CLI as a child process for every run and reads the `-json` stream through [conn3x-exec](https://github.com/conn3xorg/conn3x-exec), so a run here and a run in your terminal can't drift apart, and each project pins its own Conn3x.
 
-This is the first slice of the design in [conn3xorg/conn3x#525](https://github.com/conn3xorg/conn3x/issues/525). Expect it to change.
+This is the second slice of the design in [conn3xorg/conn3x#525](https://github.com/conn3xorg/conn3x/issues/525). Expect it to change.
 
 ## Run it
 
@@ -38,16 +38,29 @@ Your configuration needs a remote state backend: S3, Azure Blob, GCS, `pg`, `htt
 4. When it's done, the page groups the planned actions by host, then by `circuit.step`.
 5. `plan.bin` is kept under `DATA/runs/ID/`, ready for Apply.
 
-One plan at a time per project; a second one waits its turn.
+One run at a time per project; a second one waits its turn.
+
+## What an apply does
+
+A finished plan with changes gets an Apply button, as long as it's the project's newest plan and hasn't been applied. Pressing it records who approved and when, then:
+
+1. Clones the ref and moves to the commit the plan was made from, even if the branch has moved on since.
+2. `conn3x init -input=false`, then `conn3x apply -input=false plan.bin` with the saved plan file.
+3. Streams the output as the plan did, and shows each host's steps with ok or failed and the seconds each took.
+
+What was approved is what runs. If the state changed since the plan, Conn3x refuses the stale plan and the run fails with its error. A plan applies once; a newer plan in the project retires the older ones.
+
+**Cancel** on a running plan or apply sends Conn3x an interrupt, as Ctrl-C would, so it stops after the current step and releases its state lock. The run ends as `cancelled`.
+
+The apply's `-report` file isn't kept: `conn3x apply -report` doesn't go with `-json`, and the stream carries the same information.
 
 ## Not here yet
 
 The rest of the design, in the order it's planned:
 
-- Apply, with approval, and cancel: [#889](https://github.com/conn3xorg/conn3x/issues/889)
 - History with each run's plan, output and report: [#890](https://github.com/conn3xorg/conn3x/issues/890)
 - Encrypted credentials, SSH keys and `become` passwords: [#891](https://github.com/conn3xorg/conn3x/issues/891)
-- OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892)
+- OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Until then the one admin may apply any plan; the approver role and the "planners may apply their own plan" setting come with the roles.
 - Scheduled drift checks: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - Releases, a container image and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894)
 
@@ -59,7 +72,7 @@ Until then, treat it as a lab tool: one admin, plain-text environment variables,
 go vet ./... && test -z "$(gofmt -l .)" && go test -race ./...
 ```
 
-The tests use the test binary as a fake `conn3x` and serve a bare Git repository over HTTP, so they need only Go and `git`. Set `CONN3X_BIN` to a real `conn3x` to also plan a real configuration against an in-memory `http` backend.
+The tests use the test binary as a fake `conn3x` and serve a bare Git repository over HTTP, so they need only Go and `git`. Set `CONN3X_BIN` to a real `conn3x` to also plan and apply a real configuration against an in-memory `http` backend.
 
 ## License
 

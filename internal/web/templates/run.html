@@ -1,6 +1,6 @@
 {{define "title"}}Run {{.Data.Run.ID}} · {{.Data.Project.Name}}{{end}}
 {{define "content"}}
-<h1>Plan {{.Data.Run.ID}} · <a href="/projects/{{.Data.Project.ID}}">{{.Data.Project.Name}}</a></h1>
+<h1>{{if eq .Data.Run.Kind "apply"}}Apply{{else}}Plan{{end}} {{.Data.Run.ID}} · <a href="/projects/{{.Data.Project.ID}}">{{.Data.Project.Name}}</a></h1>
 {{template "status" .}}
 <h2>Output</h2>
 <pre id="log">{{range .Data.Lines}}{{lineText .}}
@@ -24,16 +24,32 @@
     {{if .Data.Run.StartedAt.Valid}} · started {{.Data.Run.StartedAt.String}}{{end}}
     {{if .Data.Run.FinishedAt.Valid}} · finished {{.Data.Run.FinishedAt.String}}{{end}}
   </p>
+  {{if .Data.Run.PlanRunID.Valid}}<p>Applies <a href="/runs/{{.Data.Run.PlanRunID.Int64}}">plan {{.Data.Run.PlanRunID.Int64}}</a>{{if .Data.Run.ApprovedAt.Valid}}, approved by {{if .Data.Run.ApprovedByName.Valid}}{{.Data.Run.ApprovedByName.String}}{{else}}a removed user{{end}} at {{.Data.Run.ApprovedAt.String}}{{end}}.</p>{{end}}
+  {{if not .Data.Run.Finished}}
+  <form method="post" action="/runs/{{.Data.Run.ID}}/cancel" style="display:inline">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="danger">Cancel</button>
+    <small>Sends Conn3x an interrupt. It stops after the current step and releases its state lock.</small>
+  </form>
+  {{end}}
+  {{if .Data.CanApply}}
+  <form method="post" action="/runs/{{.Data.Run.ID}}/apply" style="display:inline" onsubmit="return confirm('Apply plan {{.Data.Run.ID}} to {{.Data.Project.Name}}?')">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="primary">Apply</button>
+    <small>Applies exactly this plan, at commit {{printf "%.10s" .Data.Run.CommitSHA}}. A plan the state has moved past is refused.</small>
+  </form>
+  {{end}}
   {{if .Data.Run.Error}}<p class="error">{{.Data.Run.Error}}</p>{{end}}
   {{with .Data.Result}}
-    {{with .Summary}}<p><strong>Plan:</strong> {{.Add}} to add, {{.Change}} to change, {{.Remove}} to destroy{{if .Import}}, {{.Import}} to import{{end}}.</p>{{end}}
+    {{with .Summary}}<p><strong>{{if eq .Operation "apply"}}Apply:{{else}}Plan:{{end}}</strong> {{.Add}} {{if eq .Operation "apply"}}added{{else}}to add{{end}}, {{.Change}} {{if eq .Operation "apply"}}changed{{else}}to change{{end}}, {{.Remove}} {{if eq .Operation "apply"}}destroyed{{else}}to destroy{{end}}{{if .Import}}, {{.Import}} {{if eq .Operation "apply"}}imported{{else}}to import{{end}}{{end}}.</p>{{end}}
     {{range .Diagnostics}}<p class="error">{{.Severity}}: {{.Summary}}{{if .Detail}}
 {{.Detail}}{{end}}</p>{{end}}
     {{range .Hosts}}
     <h3>{{if .Name}}{{.Name}}{{else}}Other resources{{end}}</h3>
     <table>
       {{range .Steps}}{{$step := .Name}}{{range .Actions}}
-      <tr><td class="act">{{$step}}{{if .Item}}[{{.Item}}]{{end}}</td><td class="act">{{.Action}}</td><td><small>{{.Reason}}</small></td></tr>
+      <tr><td class="act">{{$step}}{{if .Item}}[{{.Item}}]{{end}}</td><td class="act">{{.Action}}</td>
+        <td>{{if .Outcome}}<span class="{{if eq .Outcome "ok"}}succeeded{{else}}failed{{end}}">{{.Outcome}}</span> <small>{{printf "%.1f" .Elapsed}}s</small>{{else}}<small>{{.Reason}}</small>{{end}}</td></tr>
       {{end}}{{end}}
     </table>
     {{end}}
@@ -41,7 +57,7 @@
     <h3>Drift since the last apply</h3>
     <table>{{range .Drift}}<tr><td class="act">{{.Addr}}</td><td class="act">{{.Action}}</td></tr>{{end}}</table>
     {{end}}
-    {{if and (not .Hosts) (not .Diagnostics) (eq $.Data.Run.Status "succeeded")}}<p>No changes. Every host already matches its circuits.</p>{{end}}
+    {{if and (not .Hosts) (not .Diagnostics) (eq $.Data.Run.Status "succeeded") (eq $.Data.Run.Kind "plan")}}<p>No changes. Every host already matches its circuits.</p>{{end}}
   {{end}}
 </div>
 {{end}}

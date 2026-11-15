@@ -11,9 +11,9 @@
   <h2>Runs</h2>
   {{if .Data.Runs}}
   <table>
-    <tr><th>#</th><th>Status</th><th>Commit</th><th>Started</th></tr>
+    <tr><th>#</th><th>Kind</th><th>Status</th><th>Commit</th><th>Started</th></tr>
     {{range .Data.Runs}}
-    <tr><td><a href="/runs/{{.ID}}">{{.ID}}</a></td><td class="status {{.Status}}">{{.Status}}</td>
+    <tr><td><a href="/runs/{{.ID}}">{{.ID}}</a></td><td>{{.Kind}}{{if .PlanRunID.Valid}} of {{.PlanRunID.Int64}}{{end}}</td><td class="status {{.Status}}">{{.Status}}</td>
       <td class="act">{{if .CommitSHA}}{{printf "%.10s" .CommitSHA}}{{end}}</td><td>{{if .StartedAt.Valid}}{{.StartedAt.String}}{{else}}{{.CreatedAt}}{{end}}</td></tr>
     {{end}}
   </table>

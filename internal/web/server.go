@@ -83,6 +83,8 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /projects/{id}/delete", s.deleteProject)
 	s.mux.HandleFunc("POST /projects/{id}/plan", s.startPlan)
 	s.mux.HandleFunc("GET /runs/{id}", s.runPage)
+	s.mux.HandleFunc("POST /runs/{id}/apply", s.startApply)
+	s.mux.HandleFunc("POST /runs/{id}/cancel", s.cancelRun)
 	s.mux.HandleFunc("GET /runs/{id}/status", s.runStatus)
 	s.mux.HandleFunc("GET /runs/{id}/events", s.runEvents)
 	return s
@@ -340,6 +342,14 @@ func (s *Server) startPlan(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/runs/%d", runID), http.StatusSeeOther)
 }
 
+// mayApply says whether u may approve and apply plan.
+// shortcut: the one admin may apply any plan; #892 brings the approver
+// role, and the setting that lets a planner apply their own plan belongs
+// there too (TODO in #892, not here).
+func mayApply(u store.User, plan store.Run) bool {
+	return u.ID != 0
+}
+
 // runData is the run page and its status partial.
 type runData struct {
 	Run     store.Run
@@ -347,6 +357,8 @@ type runData struct {
 	Lines   [][]byte
 	Last    int64
 	Result  *run.Result
+	// CanApply is true when the run is a plan this user may apply now.
+	CanApply bool
 }
 
 func (s *Server) loadRun(r *http.Request) (runData, error) {
@@ -365,7 +377,50 @@ func (s *Server) loadRun(r *http.Request) (runData, error) {
 		res := run.Group(d.Lines)
 		d.Result = &res
 	}
+	if d.Run.Kind == store.KindPlan && d.Run.Status == store.StatusSucceeded && d.Result.HasChanges() && mayApply(sess(r).user, d.Run) {
+		if d.CanApply, err = s.Store.Applicable(r.Context(), d.Run.ID); err != nil {
+			return d, err
+		}
+	}
 	return d, nil
+}
+
+func (s *Server) startApply(w http.ResponseWriter, r *http.Request) {
+	d, err := s.loadRun(r)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if !d.CanApply {
+		http.Error(w, store.ErrNotApplicable.Error(), http.StatusConflict)
+		return
+	}
+	runID, err := s.Runner.StartApply(r.Context(), d.Run, d.Project, sess(r).user.ID)
+	if errors.Is(err, store.ErrNotApplicable) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/runs/%d", runID), http.StatusSeeOther)
+}
+
+func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
+	rn, err := s.Store.Run(r.Context(), id(r))
+	if err == nil {
+		err = s.Runner.Cancel(rn.ID)
+	}
+	if errors.Is(err, store.ErrNotFound) && rn.ID != 0 {
+		http.Error(w, "this run isn't running", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/runs/%d", rn.ID), http.StatusSeeOther)
 }
 
 func (s *Server) runPage(w http.ResponseWriter, r *http.Request) {
