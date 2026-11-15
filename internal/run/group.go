@@ -10,8 +10,8 @@ import (
 	conn3xexec "github.com/conn3xorg/conn3x-exec"
 )
 
-// Result is a plan's stream arranged for a page: hosts, then each host's
-// steps, then what would happen to each.
+// Result is a plan's or an apply's stream arranged for a page: hosts, then
+// each host's steps, then what would happen, or happened, to each.
 type Result struct {
 	Hosts       []Host
 	Summary     *conn3xexec.ChangeSummary
@@ -36,12 +36,22 @@ type Step struct {
 	Actions []Action
 }
 
-// Action is one planned change.
+// Action is one planned change, or one applied in an apply. Outcome is
+// "ok" or "failed" for an apply, with how long the step took, and "" for
+// a plan.
 type Action struct {
-	Addr   string
-	Item   string
-	Action string
-	Reason string
+	Addr    string
+	Item    string
+	Action  string
+	Reason  string
+	Outcome string
+	Elapsed float64
+}
+
+// HasChanges is true when the summary counts anything to do.
+func (r Result) HasChanges() bool {
+	s := r.Summary
+	return s != nil && s.Add+s.Change+s.Remove+s.Import+s.Forget > 0
 }
 
 // Group arranges raw stream lines into a Result. Lines it doesn't know are
@@ -49,7 +59,26 @@ type Action struct {
 func Group(lines [][]byte) Result {
 	var res Result
 	hosts := map[string]*Host{}
-	steps := map[string]map[string]*Step{}
+	steps := map[string]map[string]int{} // index into hosts[h].Steps; a pointer would go stale on append
+	add := func(res conn3xexec.Resource, a Action) {
+		host, step := "", res.Addr
+		if s := res.Step; s != nil {
+			host, step = s.Host, s.Circuit+"."+s.Step
+		}
+		h := hosts[host]
+		if h == nil {
+			h = &Host{Name: host}
+			hosts[host] = h
+			steps[host] = map[string]int{}
+		}
+		i, ok := steps[host][step]
+		if !ok {
+			i = len(h.Steps)
+			h.Steps = append(h.Steps, Step{Name: step})
+			steps[host][step] = i
+		}
+		h.Steps[i].Actions = append(h.Steps[i].Actions, a)
+	}
 	for _, line := range lines {
 		var ev conn3xexec.Event
 		if json.Unmarshal(line, &ev) != nil {
@@ -72,23 +101,19 @@ func Group(lines [][]byte) Result {
 			if ev.Change == nil || ev.Change.Action == "noop" {
 				continue
 			}
-			host, step := "", ev.Change.Resource.Addr
-			if s := ev.Change.Resource.Step; s != nil {
-				host, step = s.Host, s.Circuit+"."+s.Step
+			add(ev.Change.Resource, action(ev.Change))
+		case "apply_complete", "apply_errored":
+			if ev.Hook == nil {
+				continue
 			}
-			h := hosts[host]
-			if h == nil {
-				h = &Host{Name: host}
-				hosts[host] = h
-				steps[host] = map[string]*Step{}
+			a := Action{Addr: ev.Hook.Resource.Addr, Action: ev.Hook.Action, Outcome: "ok", Elapsed: ev.Hook.Elapsed}
+			if ev.Type == "apply_errored" {
+				a.Outcome = "failed"
 			}
-			st := steps[host][step]
-			if st == nil {
-				h.Steps = append(h.Steps, Step{Name: step})
-				st = &h.Steps[len(h.Steps)-1]
-				steps[host][step] = st
+			if ev.Hook.Resource.Step != nil {
+				a.Item = ev.Hook.Resource.Step.Item
 			}
-			st.Actions = append(st.Actions, action(ev.Change))
+			add(ev.Hook.Resource, a)
 		}
 	}
 	for _, h := range hosts {

@@ -51,6 +51,35 @@ func TestGroup(t *testing.T) {
 	}
 }
 
+func hook(typ, host, step, item, action string, elapsed float64) []byte {
+	return []byte(fmt.Sprintf(`{"type":%q,"hook":{"resource":{"addr":"conn3x_command.box__%s","conn3x":{"circuit":"box","step":%q,"host":%q,"item":%q}},"action":%q,"elapsed_seconds":%g}}`, typ, step, step, host, item, action, elapsed))
+}
+
+func TestGroupApply(t *testing.T) {
+	lines := [][]byte{
+		hook("apply_start", "web1", "build", "", "create", 0),
+		hook("apply_progress", "web1", "build", "", "create", 10),
+		hook("apply_complete", "web1", "build", "", "create", 12.5),
+		hook("apply_complete", "web1", "deploy", "a", "create", 1),
+		hook("apply_errored", "web1", "build", "x", "create", 3), // back to an earlier step
+		[]byte(`{"type":"change_summary","changes":{"add":2,"change":0,"remove":0,"operation":"apply"}}`),
+	}
+	res := Group(lines)
+	if len(res.Hosts) != 1 || len(res.Hosts[0].Steps) != 2 || !res.HasChanges() {
+		t.Fatalf("%+v", res)
+	}
+	build, deploy := res.Hosts[0].Steps[0], res.Hosts[0].Steps[1]
+	if len(build.Actions) != 2 || build.Actions[0].Outcome != "ok" || build.Actions[0].Elapsed != 12.5 || build.Actions[1].Outcome != "failed" || build.Actions[1].Item != "x" {
+		t.Errorf("build %+v", build.Actions)
+	}
+	if len(deploy.Actions) != 1 || deploy.Actions[0].Item != "a" {
+		t.Errorf("deploy %+v", deploy.Actions)
+	}
+	if (Result{}).HasChanges() || Group(nil).HasChanges() {
+		t.Error("an empty result has changes")
+	}
+}
+
 func TestValidateGitURL(t *testing.T) {
 	ok := []string{"https://github.com/conn3xorg/conn3x.git", "ssh://git@github.com/x/y.git", "git@github.com:x/y.git", "github.com:x/y", "http://127.0.0.1:8080/x.git", "http://localhost/x.git"}
 	bad := []string{"", "-oProxyCommand=evil", "file:///etc", "ext::sh -c evil", "/tmp/repo.git", "http://example.com/x.git", "https://", "git@host:ext::x", `C:\repo`, "host:: x"}

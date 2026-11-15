@@ -69,6 +69,11 @@ var migrations = []string{
 		line BLOB NOT NULL,
 		PRIMARY KEY (run_id, seq)
 	);`,
+	// 2: an apply points at the plan it runs and records who approved it.
+	`ALTER TABLE runs ADD COLUMN plan_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL;
+	ALTER TABLE runs ADD COLUMN approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+	ALTER TABLE runs ADD COLUMN approved_at TEXT;
+	CREATE INDEX runs_plan ON runs(plan_run_id);`,
 }
 
 // Store is the database.
@@ -227,9 +232,16 @@ const (
 	StatusRunning   = "running"
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
+	StatusCancelled = "cancelled"
 )
 
-// Run is one conn3x run. Kind is "plan" for now; #889 adds "apply".
+// Run kinds.
+const (
+	KindPlan  = "plan"
+	KindApply = "apply"
+)
+
+// Run is one conn3x run: a plan, or an apply of a plan run's saved plan.
 type Run struct {
 	ID            int64
 	ProjectID     int64
@@ -242,16 +254,25 @@ type Run struct {
 	CreatedAt     string
 	StartedAt     sql.NullString
 	FinishedAt    sql.NullString
+	// PlanRunID is the plan an apply runs, and who approved it when.
+	PlanRunID      sql.NullInt64
+	ApprovedBy     sql.NullInt64
+	ApprovedByName sql.NullString
+	ApprovedAt     sql.NullString
 }
 
 // Finished is true once the run has a final status.
-func (r Run) Finished() bool { return r.Status == StatusSucceeded || r.Status == StatusFailed }
+func (r Run) Finished() bool {
+	return r.Status == StatusSucceeded || r.Status == StatusFailed || r.Status == StatusCancelled
+}
 
-const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, created_at, started_at, finished_at"
+const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, created_at, started_at, finished_at, " +
+	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at"
 
 func scanRun(row interface{ Scan(...any) error }) (Run, error) {
 	var r Run
-	err := row.Scan(&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedAt, &r.StartedAt, &r.FinishedAt)
+	err := row.Scan(&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
+		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -264,6 +285,38 @@ func (s *Store) CreateRun(ctx context.Context, projectID int64, kind string, use
 		projectID, kind, StatusQueued, userID, now())
 	if err != nil {
 		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ErrNotApplicable is a plan that can't be applied: it hasn't succeeded,
+// it was applied already, or the project has a newer plan.
+var ErrNotApplicable = errors.New("this plan can't be applied any more: it has been applied, or a newer plan has been made since")
+
+// applicable is the plan row p that CreateApply accepts.
+const applicable = `FROM runs p WHERE p.id = ? AND p.kind = 'plan' AND p.status = 'succeeded'
+	AND NOT EXISTS (SELECT 1 FROM runs a WHERE a.plan_run_id = p.id)
+	AND NOT EXISTS (SELECT 1 FROM runs n WHERE n.project_id = p.project_id AND n.kind = 'plan' AND n.id > p.id)`
+
+// Applicable says whether CreateApply would accept the plan run.
+func (s *Store) Applicable(ctx context.Context, planID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) "+applicable, planID).Scan(&n)
+	return n == 1, err
+}
+
+// CreateApply adds a queued apply of a plan run, approved by userID now,
+// and returns its ID. One insert checks and claims the plan, so two
+// approvers can't both apply it.
+func (s *Store) CreateApply(ctx context.Context, planID, userID int64) (int64, error) {
+	t := now()
+	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at, plan_run_id, approved_by, approved_at) "+
+		"SELECT p.project_id, ?, ?, ?, ?, p.id, ?, ? "+applicable, KindApply, StatusQueued, userID, t, userID, t, planID)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return 0, ErrNotApplicable
 	}
 	return res.LastInsertId()
 }

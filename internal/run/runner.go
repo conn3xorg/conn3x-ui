@@ -35,7 +35,8 @@ type Line struct {
 	Done bool
 }
 
-// Runner runs plans. One at a time per project; the rest queue.
+// Runner runs plans and applies. One at a time per project; the rest
+// queue.
 type Runner struct {
 	Store   *store.Store
 	DataDir string
@@ -43,35 +44,65 @@ type Runner struct {
 	Git string
 	Log *log.Logger
 
-	ctx   context.Context
-	wg    sync.WaitGroup
-	mu    sync.Mutex
-	locks map[int64]*sync.Mutex
-	subs  map[int64]map[chan Line]struct{}
+	ctx     context.Context
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	locks   map[int64]*sync.Mutex
+	subs    map[int64]map[chan Line]struct{}
+	cancels map[int64]context.CancelCauseFunc
 }
 
 // New makes a Runner. Cancelling ctx interrupts every running conn3x.
 func New(ctx context.Context, st *store.Store, dataDir string) *Runner {
 	return &Runner{Store: st, DataDir: dataDir, Log: log.Default(), ctx: ctx,
-		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}}
+		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}}
 }
 
 // Wait blocks until every run has finished.
 func (r *Runner) Wait() { r.wg.Wait() }
 
-// PlanFile is where a run's saved plan lives, for #889 to apply.
+// PlanFile is where a plan run's saved plan lives, for an apply.
 func (r *Runner) PlanFile(runID int64) string {
 	return filepath.Join(r.DataDir, "runs", fmt.Sprint(runID), "plan.bin")
 }
 
 // StartPlan queues a plan of p and returns the run's ID at once.
 func (r *Runner) StartPlan(ctx context.Context, p store.Project, userID int64) (int64, error) {
-	id, err := r.Store.CreateRun(ctx, p.ID, "plan", userID)
+	id, err := r.Store.CreateRun(ctx, p.ID, store.KindPlan, userID)
 	if err != nil {
 		return 0, err
 	}
-	r.wg.Go(func() { r.plan(id, p) })
+	r.wg.Go(func() { r.run(id, p, func(ctx context.Context) error { return r.doPlan(ctx, id, p) }) })
 	return id, nil
+}
+
+// StartApply queues an apply of plan, approved by userID, and returns the
+// run's ID at once. The plan must still be the project's newest and not
+// yet applied, or the error is store.ErrNotApplicable.
+func (r *Runner) StartApply(ctx context.Context, plan store.Run, p store.Project, userID int64) (int64, error) {
+	id, err := r.Store.CreateApply(ctx, plan.ID, userID)
+	if err != nil {
+		return 0, err
+	}
+	r.wg.Go(func() { r.run(id, p, func(ctx context.Context) error { return r.doApply(ctx, id, p, plan) }) })
+	return id, nil
+}
+
+// ErrCancelled is why a run's context ended when somebody pressed Cancel.
+var ErrCancelled = errors.New("cancelled")
+
+// Cancel interrupts a queued or running run. conn3x gets an interrupt, as
+// Ctrl-C would, so it releases its state lock. A run that isn't running
+// is store.ErrNotFound.
+func (r *Runner) Cancel(runID int64) error {
+	r.mu.Lock()
+	cancel := r.cancels[runID]
+	r.mu.Unlock()
+	if cancel == nil {
+		return store.ErrNotFound
+	}
+	cancel(ErrCancelled)
+	return nil
 }
 
 func (r *Runner) lock(projectID int64) *sync.Mutex {
@@ -85,20 +116,34 @@ func (r *Runner) lock(projectID int64) *sync.Mutex {
 	return m
 }
 
-func (r *Runner) plan(id int64, p store.Project) {
+// run takes the project's turn, runs do, and records how it ended.
+func (r *Runner) run(id int64, p store.Project, do func(context.Context) error) {
+	ctx, cancel := context.WithCancelCause(r.ctx)
+	r.mu.Lock()
+	r.cancels[id] = cancel
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.cancels, id)
+		r.mu.Unlock()
+		cancel(nil)
+	}()
 	m := r.lock(p.ID)
 	m.Lock()
 	defer m.Unlock()
-	ctx := context.Background()
-	if err := r.Store.StartRun(ctx, id); err != nil {
+	bg := context.Background()
+	if err := r.Store.StartRun(bg, id); err != nil {
 		r.Log.Printf("run %d: %v", id, err)
 	}
 	status, msg := store.StatusSucceeded, ""
-	if err := r.doPlan(id, p); err != nil {
+	if err := do(ctx); err != nil && context.Cause(ctx) == ErrCancelled {
+		status = store.StatusCancelled
+		r.note(id, "Cancelled")
+	} else if err != nil {
 		status, msg = store.StatusFailed, err.Error()
 		r.note(id, "Error: "+msg)
 	}
-	if err := r.Store.FinishRun(ctx, id, status, msg); err != nil {
+	if err := r.Store.FinishRun(bg, id, status, msg); err != nil {
 		r.Log.Printf("run %d: %v", id, err)
 	}
 	r.mu.Lock()
@@ -114,30 +159,57 @@ func (r *Runner) plan(id int64, p store.Project) {
 var ErrLocalState = errors.New("this configuration keeps its state in a local file, which would be lost with the run's temp directory. " +
 	"conn3x-ui needs a remote backend, such as s3, azurerm, gcs, pg or http. Add a backend block to the configuration and plan again")
 
-func (r *Runner) doPlan(id int64, p store.Project) error {
-	ctx := r.ctx
+// checkout clones p's ref into a fresh temp directory and, when sha is
+// set, moves to that commit instead of the ref's current head. It returns
+// the directory conn3x runs in, the commit, and how to remove it all.
+func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha string) (work, commit string, cleanup func(), err error) {
 	tmp, err := os.MkdirTemp("", "conn3x-ui-run-")
 	if err != nil {
-		return err
+		return "", "", nil, err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() {
+		if err != nil {
+			os.RemoveAll(tmp)
+		}
+	}()
 	repo := filepath.Join(tmp, "repo")
 
 	r.note(id, fmt.Sprintf("git clone --depth 1 --branch %s %s", p.GitRef, redactURL(p.GitURL)))
 	if out, err := r.git(ctx, "clone", "--quiet", "--depth", "1", "--branch", p.GitRef, "--", p.GitURL, repo); err != nil {
-		return fmt.Errorf("git clone: %v: %s", err, strings.TrimSpace(string(out)))
+		return "", "", nil, fmt.Errorf("git clone: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	sha, err := r.git(ctx, "-C", repo, "rev-parse", "HEAD")
+	if sha != "" {
+		if !commitSHA.MatchString(sha) {
+			return "", "", nil, fmt.Errorf("the plan's commit %q isn't a commit ID", sha)
+		}
+		r.note(id, "git fetch --depth 1 origin "+sha)
+		if out, err := r.git(ctx, "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", sha); err != nil {
+			return "", "", nil, fmt.Errorf("git fetch %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
+		}
+		if out, err := r.git(ctx, "-C", repo, "checkout", "--quiet", "--detach", sha); err != nil {
+			return "", "", nil, fmt.Errorf("git checkout %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
+		}
+	}
+	head, err := r.git(ctx, "-C", repo, "rev-parse", "HEAD")
 	if err != nil {
-		return fmt.Errorf("git rev-parse: %v", err)
+		return "", "", nil, fmt.Errorf("git rev-parse: %v", err)
 	}
-	r.Store.SetRunCommit(context.Background(), id, strings.TrimSpace(string(sha)))
-	r.note(id, "at commit "+strings.TrimSpace(string(sha)))
+	commit = strings.TrimSpace(string(head))
+	r.Store.SetRunCommit(context.Background(), id, commit)
+	r.note(id, "at commit "+commit)
 
-	work, err := workDir(repo, p.Path)
+	if work, err = workDir(repo, p.Path); err != nil {
+		return "", "", nil, err
+	}
+	return work, commit, func() { os.RemoveAll(tmp) }, nil
+}
+
+func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project) error {
+	work, _, cleanup, err := r.checkout(ctx, id, p, "")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 
 	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: p.EnvList(), Stderr: noteWriter{r, id}}
 	r.note(id, "conn3x init -input=false")
@@ -163,6 +235,33 @@ func (r *Runner) doPlan(id int64, p store.Project) error {
 	}
 	return copyFile(filepath.Join(work, "plan.bin"), r.PlanFile(id))
 }
+
+// doApply checks out the commit plan was made from and applies its saved
+// plan file. A plan that no longer matches the state is refused by conn3x
+// itself, and that error ends the run.
+func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan store.Run) error {
+	work, _, cleanup, err := r.checkout(ctx, id, p, plan.CommitSHA)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := copyFile(r.PlanFile(plan.ID), filepath.Join(work, "plan.bin")); err != nil {
+		return fmt.Errorf("plan %d has no saved plan file: %w", plan.ID, err)
+	}
+	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: p.EnvList(), Stderr: noteWriter{r, id}}
+	r.note(id, "conn3x init -input=false")
+	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	r.note(id, fmt.Sprintf("conn3x apply -input=false plan.bin (plan %d)", plan.ID))
+	if err := c.Run(ctx, r.record(id), "apply", "-input=false", "plan.bin"); err != nil {
+		return fmt.Errorf("apply: %w", err)
+	}
+	return nil
+}
+
+// commitSHA is a full SHA-1 or SHA-256 commit ID, all git takes here.
+var commitSHA = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // redactURL hides a password or token in a URL, for the run's log.
 func redactURL(u string) string {
