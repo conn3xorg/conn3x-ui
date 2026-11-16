@@ -226,6 +226,29 @@ func ValidateCredentialName(name string) error {
 	return nil
 }
 
+// reservedEnv are variables that change how a run's programs start, load
+// code or reach a host: git, ssh, the dynamic loader, the shell, conn3x and
+// the language runtimes a provider or hook may start. An env credential
+// named for one could run commands on this server, so none may be one.
+var (
+	reservedEnv       = []string{"PATH", "HOME", "SHELL", "ENV", "BASH_ENV", "IFS", "PS4", "PROMPT_COMMAND", "CDPATH", "TMPDIR", "NODE_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "GCONV_PATH", "LOCPATH", "OPENSSL_CONF", "OPENSSL_ENGINES", "GLIBC_TUNABLES"}
+	reservedEnvPrefix = []string{"LD_", "DYLD_", "GIT_", "SSH_", "TF_", "CONN3X_", "OPENTOFU_", "PYTHON", "PERL", "RUBY", "MALLOC_"}
+)
+
+// ValidateCredentialEnv refuses an env credential name that's one of
+// reservedEnv, whatever its case.
+func ValidateCredentialEnv(name string) error {
+	up := strings.ToUpper(name)
+	reserved := slices.Contains(reservedEnv, up)
+	for _, p := range reservedEnvPrefix {
+		reserved = reserved || strings.HasPrefix(up, p)
+	}
+	if reserved {
+		return fmt.Errorf("%s changes how a run's programs start, so it can't be a credential; set it in the project's environment, which a site admin controls", name)
+	}
+	return nil
+}
+
 // CredentialEnv is the variable a file credential's path comes in:
 // CONN3X_CRED_ and the name in upper case, so ssh_key is
 // CONN3X_CRED_SSH_KEY.
@@ -284,6 +307,10 @@ func writeCredentials(parent string, secrets []store.Secret) (dir string, env []
 			return "", nil, err
 		}
 		if s.Kind == store.CredEnv {
+			if err := ValidateCredentialEnv(s.Name); err != nil {
+				os.RemoveAll(dir)
+				return "", nil, err
+			}
 			env = append(env, s.Name+"="+string(s.Value))
 			continue
 		}
@@ -525,7 +552,8 @@ func (r *Runner) git(ctx context.Context, env []string, args ...string) ([]byte,
 	cmd := exec.CommandContext(ctx, git, args...)
 	// Never hang on a password or host-key prompt nobody can answer, and
 	// never let the environment widen the protocols, which ext:: would.
-	cmd.Env = append(append(append(os.Environ(), "GIT_SSH_COMMAND=ssh -o BatchMode=yes"), env...), "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL=https:ssh:http")
+	// The UI's own settings come last, so nothing in env replaces them.
+	cmd.Env = append(append(os.Environ(), env...), "GIT_SSH_COMMAND=ssh -o BatchMode=yes", "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL=https:ssh:http")
 	return cmd.CombinedOutput()
 }
 

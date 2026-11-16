@@ -3,18 +3,18 @@
 <label for="name">Name</label>
 <input id="name" name="name" value="{{.Data.Form.Name}}" required>
 <label for="git_url">Git URL</label>
-<input id="git_url" name="git_url" value="{{.Data.Form.GitURL}}" placeholder="https://github.com/you/circuits.git" required>
+<input id="git_url" name="git_url" value="{{.Data.Form.GitURL}}" placeholder="https://github.com/you/circuits.git" required{{if not .User.Admin}} readonly{{end}}>
 <small>https://, ssh:// or git@host:repo. The UI's host needs to be able to reach it without a prompt.</small>
 <label for="git_ref">Branch or tag</label>
 <input id="git_ref" name="git_ref" value="{{.Data.Form.GitRef}}">
 <label for="path">Path in the repository</label>
 <input id="path" name="path" value="{{.Data.Form.Path}}">
 <label for="conn3x_path">Conn3x binary</label>
-<input id="conn3x_path" name="conn3x_path" value="{{.Data.Form.Conn3xPath}}">
+<input id="conn3x_path" name="conn3x_path" value="{{.Data.Form.Conn3xPath}}"{{if not .User.Admin}} readonly{{end}}>
 <small>A path on the UI's host, or <code>conn3x</code> for the one on PATH. Each project can pin its own.</small>
 <label for="env">Environment variables</label>
-<textarea id="env" name="env" placeholder="AWS_PROFILE=prod&#10;TF_VAR_region=eu-west-1">{{.Data.Form.Env}}</textarea>
-<small>One NAME=value per line, stored in plain text. Put secrets in Credentials instead.</small>
+<textarea id="env" name="env" placeholder="AWS_PROFILE=prod&#10;TF_VAR_region=eu-west-1"{{if not .User.Admin}} readonly{{end}}>{{.Data.Form.Env}}</textarea>
+<small>One NAME=value per line, stored in plain text. Put secrets in Credentials instead.{{if not .User.Admin}} Only a site admin can change the Git URL, the Conn3x binary and these, since they decide what runs on this server.{{end}}</small>
 <label for="schedule">Drift check schedule</label>
 <input id="schedule" name="schedule" value="{{.Data.Form.Schedule}}" placeholder="6h, or 0 3 * * *">
 <small>An interval such as <code>1h</code> or <code>24h</code>, or five cron fields in UTC. Each check runs <code>conn3x plan -refresh-only</code>. Blank for none.</small>

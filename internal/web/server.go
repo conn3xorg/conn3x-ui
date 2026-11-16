@@ -461,6 +461,12 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 	if form.WebhookURL == "" && r.PostFormValue("webhook_clear") == "" {
 		form.WebhookURL = p.WebhookURL
 	}
+	// What a run executes, and with what environment, can run commands on
+	// this server and so reach every project's credentials; only a site
+	// admin may change it.
+	if err == nil && !sess(r).user.Admin && (form.GitURL != p.GitURL || form.Conn3xPath != p.Conn3xPath || form.Env != p.Env) {
+		err = errors.New("only a site admin can change the Git URL, the Conn3x binary or the environment variables")
+	}
 	if err == nil {
 		err = s.Store.UpdateProject(r.Context(), form)
 	}
@@ -493,6 +499,9 @@ func (s *Server) setCredential(w http.ResponseWriter, r *http.Request) {
 		value += "\n" // a pasted key loses its last newline, and ssh won't read a key without one
 	}
 	err := run.ValidateCredentialName(name)
+	if err == nil && kind == store.CredEnv {
+		err = run.ValidateCredentialEnv(name)
+	}
 	switch {
 	case err != nil:
 	case kind != store.CredFile && kind != store.CredEnv:

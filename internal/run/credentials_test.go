@@ -96,3 +96,25 @@ func TestRemoveLeftovers(t *testing.T) {
 		}
 	}
 }
+
+// A run refuses an env credential named for a variable that changes how its
+// programs start, even one saved before such names were refused, and
+// leaves nothing behind.
+func TestWriteCredentialsRefusesReservedNames(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"GIT_SSH_COMMAND", "LD_PRELOAD", "Path", "SSH_AUTH_SOCK"} {
+		_, _, err := writeCredentials(parent, []store.Secret{
+			{Name: "ssh_key", Kind: store.CredFile, Value: []byte("key\n")},
+			{Name: name, Kind: store.CredEnv, Value: []byte("x")},
+		})
+		if err == nil || !strings.Contains(err.Error(), "can't be a credential") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if left, _ := os.ReadDir(parent); len(left) != 0 {
+		t.Errorf("left behind: %v", left)
+	}
+	if err := ValidateCredentialEnv("AWS_ACCESS_KEY_ID"); err != nil {
+		t.Error(err)
+	}
+}

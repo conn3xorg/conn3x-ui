@@ -162,6 +162,16 @@ Add a **drift webhook** to hear about it. When a check finds drift, or fails, th
 
 The URL must be `http://` or `https://`. Webhook URLs often carry a token, so once saved the page shows only the host, and the log never prints it. Leave the field blank to keep the saved one, or tick **Remove the webhook**.
 
+## Trust model
+
+Every run executes a project's circuit on this server, as the user the UI runs as. A circuit can run commands on the machine that plans it, for example through an `external` data source, and that user can read the UI's database and its credentials key. So:
+
+- **Anyone who can push to a project's repository can run commands here**, and through them read every project's credentials, not only that project's. It's the same with other tools that plan infrastructure code from Git. Give push access only to people you'd trust with this server.
+- **Only a site admin can change what a run executes:** a project's Git URL, its Conn3x binary and its environment variables. A project admin can't, and the form shows them read-only.
+- **No credential can be named for a variable that changes how a run's programs start**, such as `PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND` or anything starting `TF_` or `CONN3X_`. They're refused when a credential is saved and again when a run starts.
+
+Roles keep people from seeing or changing projects they have no part in; they don't wall one project's runs off from another's. Teams that must not reach each other's credentials need a UI each. Running each run on its own, away from the others, is [#947](https://github.com/conn3xorg/conn3x/issues/947).
+
 ## Users and roles
 
 Everyone signs in with their own account. A site admin makes them under **Users**: a name, and a password you type or leave blank for a generated one, shown once. Pass it on, and they can change it under their name at the top. From the same page a site admin resets a password or disables an account. Either one signs that person out everywhere, and a disabled account can't sign in. Nobody can disable themselves or drop their own admin, so the last admin can't lock everyone out.
