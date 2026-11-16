@@ -19,20 +19,42 @@ The first start creates an `admin` account and prints its password to the log, o
 
 `-data` is where the SQLite database and each run's saved plan live. Back it up like any other file.
 
+Credentials need a key. Without one the UI runs, but won't save or use them:
+
+```sh
+(umask 077; openssl rand -base64 32 > conn3x-ui.key)
+./conn3x-ui serve -listen 127.0.0.1:8080 -data ./data -key-file conn3x-ui.key
+```
+
+Or put the same base64 in `CONN3X_UI_KEY` instead of `-key-file`; the flag wins when both are set. The UI takes the variable out of its environment once it's read, so no run inherits it. Keep the key apart from `-data`'s backups: one without the other opens nothing. Lose the key and the saved credentials are gone; set them again.
+
 Listening on anything other than localhost? Put TLS in front. The session cookie is marked Secure off localhost, so plain http to another machine won't sign you in.
 
 ## A project
 
-- **Git URL**: `https://`, `ssh://` or `git@host:repo`. The UI's host clones it for every run, shallowly, so it needs access without a prompt: a deploy key in `~/.ssh` for now. Don't put a token in the URL: it's stored as plain text, like the environment variables below. Tokens come with credentials ([#891](https://github.com/conn3xorg/conn3x/issues/891)).
+- **Git URL**: `https://`, `ssh://` or `git@host:repo`. The UI's host clones it for every run, shallowly, so it needs access without a prompt: a deploy key in `~/.ssh`, or one in the project's [credentials](#credentials). Don't put a token in the URL: it's stored as plain text, like the environment variables below.
 - **Branch or tag** and a **path** inside the repository.
 - **Conn3x binary**: a path, or `conn3x` for the one on PATH. Each project can pin a different one.
-- **Environment variables**: `NAME=value` lines the run gets, such as `AWS_PROFILE`. Plain text in the database for now; see below.
+- **Environment variables**: `NAME=value` lines the run gets, such as `AWS_PROFILE`. Plain text in the database, so nothing secret: that goes in credentials.
 
 Your configuration needs a remote state backend: S3, Azure Blob, GCS, `pg`, `http`, any of them. The UI holds no state, so losing the UI never loses state. A plan of a configuration with local state fails and says so. The check reads the backend Conn3x configured during `init`, so it works whichever file or module the backend block is in.
 
+## Credentials
+
+SSH keys, `become` passwords, cloud keys: each project keeps its own, under **Credentials** on its page. A credential has a name, a value, and how it reaches the run:
+
+- **a file**: written to a private temp directory (`0700`, the file `0600`), with its path in `CONN3X_CRED_` plus the name in upper case. A file named `ssh_key` is at `$CONN3X_CRED_SSH_KEY`.
+- **an environment variable**: the name is the variable, such as `AWS_SECRET_ACCESS_KEY`. It wins over an environment line with the same name.
+
+Names are letters, digits and `_`, not starting with a digit, and unique in a project whatever their case. Saving a name that's there already replaces it.
+
+Values are sealed with AES-256-GCM under the key, each bound to its project and name, so a value copied to another row won't open. Once saved, the page shows a credential's name, kind and when it was set, never its value. The temp directory is removed when the run ends, however it ends. Nothing about a credential is stored with the run, and any value that turns up in a run's output or error is replaced with `<hidden>` before it's kept or shown.
+
+Git gets the credentials too, so a project can bring its own deploy key: a file credential `git_key`, and a variable `GIT_SSH_COMMAND` set to `ssh -i "$CONN3X_CRED_GIT_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`. For an https token, set git's own `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0` variables, such as `http.extraHeader` and `Authorization: Bearer TOKEN`.
+
 ## What a plan does
 
-1. `git clone --depth 1 --branch REF URL` into a fresh temp directory.
+1. Writes the project's credentials into a private temp directory, then `git clone --depth 1 --branch REF URL` into another.
 2. `conn3x init -input=false`, then `conn3x plan -input=false -out=plan.bin`, both with `-json`.
 3. Every line of the stream goes to the database and to your browser as it arrives.
 4. When it's done, the page groups the planned actions by host, then by `circuit.step`.
@@ -62,12 +84,13 @@ The report is kept beside the plan, under `DATA/runs/ID/`, and the apply's page 
 
 The rest of the design, in the order it's planned:
 
-- Encrypted credentials, SSH keys and `become` passwords: [#891](https://github.com/conn3xorg/conn3x/issues/891)
 - OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Until then the one admin may apply any plan; the approver role and the "planners may apply their own plan" setting come with the roles.
 - Scheduled drift checks: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - Releases, a container image and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894)
 
-Until then, treat it as a lab tool: one admin, plain-text environment variables, runs on the UI's own host.
+Credentials are in, with the key from a file or a variable; a KMS for the key comes later, also under [#891](https://github.com/conn3xorg/conn3x/issues/891).
+
+Until then, treat it as a lab tool: one admin, runs on the UI's own host.
 
 ## Developing
 

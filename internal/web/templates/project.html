@@ -25,6 +25,32 @@
     {{template "project_form" .}}
     <p><button class="primary">Save</button></p>
   </form>
+  <h2>Credentials</h2>
+  {{if .Data.Credentials}}
+  <table>
+    <tr><th>Name</th><th>Reaches the run as</th><th>Set</th><th></th></tr>
+    {{range .Data.Credentials}}
+    <tr><td class="act">{{.Name}}</td><td class="act">{{if eq .Kind "file"}}a file at ${{credEnv .Name}}{{else}}${{.Name}}{{end}}</td><td>{{.SetAt}}</td>
+      <td><form method="post" action="/projects/{{$.Data.Project.ID}}/credentials/{{.Name}}/delete" onsubmit="return confirm('Delete the credential {{.Name}}?')">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="danger">Delete</button></form></td></tr>
+    {{end}}
+  </table>
+  {{else}}<p>No credentials yet.</p>{{end}}
+  {{if .Data.HasKey}}
+  <form method="post" action="/projects/{{.Data.Project.ID}}/credentials">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="cred_name">Name</label>
+    <input id="cred_name" name="name" placeholder="ssh_key" required>
+    <label for="cred_kind">Reaches the run as</label>
+    <select id="cred_kind" name="kind"><option value="file">a file</option><option value="env">an environment variable</option></select>
+    <label for="cred_value">Value</label>
+    <textarea id="cred_value" name="value" autocomplete="off" spellcheck="false" required></textarea>
+    <small>Encrypted in the database and never shown again. A file named ssh_key reaches the run at the path in <code>$CONN3X_CRED_SSH_KEY</code>; a variable keeps its own name. Saving an existing name replaces it.</small>
+    <p><button class="primary">Save credential</button></p>
+  </form>
+  {{else}}
+  <p><small>Credentials need a key. Make one with <code>openssl rand -base64 32 &gt; key</code>, then start conn3x-ui with <code>-key-file key</code>, or with the value in <code>CONN3X_UI_KEY</code>.</small></p>
+  {{end}}
   <form method="post" action="/projects/{{.Data.Project.ID}}/delete" onsubmit="return confirm('Delete {{.Data.Project.Name}} and its run history?')">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <button class="danger">Delete project</button>

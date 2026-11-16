@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -50,12 +51,14 @@ type Runner struct {
 	locks   map[int64]*sync.Mutex
 	subs    map[int64]map[chan Line]struct{}
 	cancels map[int64]context.CancelCauseFunc
+	// hide replaces each running run's credential values in its log.
+	hide map[int64]*strings.Replacer
 }
 
 // New makes a Runner. Cancelling ctx interrupts every running conn3x.
 func New(ctx context.Context, st *store.Store, dataDir string) *Runner {
 	return &Runner{Store: st, DataDir: dataDir, Log: log.Default(), ctx: ctx,
-		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}}
+		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}, hide: map[int64]*strings.Replacer{}}
 }
 
 // Wait blocks until every run has finished.
@@ -77,7 +80,9 @@ func (r *Runner) StartPlan(ctx context.Context, p store.Project, userID int64) (
 	if err != nil {
 		return 0, err
 	}
-	r.wg.Go(func() { r.run(id, p, func(ctx context.Context) error { return r.doPlan(ctx, id, p) }) })
+	r.wg.Go(func() {
+		r.run(id, p, func(ctx context.Context, env []string) error { return r.doPlan(ctx, id, p, env) })
+	})
 	return id, nil
 }
 
@@ -89,7 +94,9 @@ func (r *Runner) StartApply(ctx context.Context, plan store.Run, p store.Project
 	if err != nil {
 		return 0, err
 	}
-	r.wg.Go(func() { r.run(id, p, func(ctx context.Context) error { return r.doApply(ctx, id, p, plan) }) })
+	r.wg.Go(func() {
+		r.run(id, p, func(ctx context.Context, env []string) error { return r.doApply(ctx, id, p, plan, env) })
+	})
 	return id, nil
 }
 
@@ -121,8 +128,9 @@ func (r *Runner) lock(projectID int64) *sync.Mutex {
 	return m
 }
 
-// run takes the project's turn, runs do, and records how it ended.
-func (r *Runner) run(id int64, p store.Project, do func(context.Context) error) {
+// run takes the project's turn, hands the project's credentials to do
+// with its environment, and records how it ended.
+func (r *Runner) run(id int64, p store.Project, do func(ctx context.Context, env []string) error) {
 	ctx, cancel := context.WithCancelCause(r.ctx)
 	r.mu.Lock()
 	r.cancels[id] = cancel
@@ -130,6 +138,7 @@ func (r *Runner) run(id int64, p store.Project, do func(context.Context) error) 
 	defer func() {
 		r.mu.Lock()
 		delete(r.cancels, id)
+		delete(r.hide, id)
 		r.mu.Unlock()
 		cancel(nil)
 	}()
@@ -141,11 +150,16 @@ func (r *Runner) run(id int64, p store.Project, do func(context.Context) error) 
 		r.Log.Printf("run %d: %v", id, err)
 	}
 	status, msg := store.StatusSucceeded, ""
-	if err := do(ctx); err != nil && context.Cause(ctx) == ErrCancelled {
+	env, cleanup, err := r.credentials(id, p)
+	if err == nil {
+		defer cleanup() // success, failure and cancel alike
+		err = do(ctx, append(p.EnvList(), env...))
+	}
+	if err != nil && context.Cause(ctx) == ErrCancelled {
 		status = store.StatusCancelled
 		r.note(id, "Cancelled")
 	} else if err != nil {
-		status, msg = store.StatusFailed, err.Error()
+		status, msg = store.StatusFailed, r.scrub(id, err.Error())
 		r.note(id, "Error: "+msg)
 	}
 	lines, _, err := r.Store.Events(bg, id)
@@ -167,6 +181,113 @@ func (r *Runner) run(id int64, p store.Project, do func(context.Context) error) 
 	r.mu.Unlock()
 }
 
+// credentials opens p's credentials, hides their values in the run's log
+// from now on, and writes the file ones into a fresh private directory. It
+// returns the environment the run gets for them and how to remove the
+// directory.
+func (r *Runner) credentials(id int64, p store.Project) (env []string, cleanup func(), err error) {
+	secrets, err := r.Store.Secrets(context.Background(), p.ID)
+	if err != nil || len(secrets) == 0 {
+		return nil, func() {}, err
+	}
+	r.mu.Lock()
+	r.hide[id] = hider(secrets)
+	r.mu.Unlock()
+	dir, env, err := writeCredentials(secrets)
+	if err != nil {
+		return nil, nil, err
+	}
+	return env, func() { os.RemoveAll(dir) }, nil
+}
+
+var credName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// ValidateCredentialName accepts a name that is an environment variable's,
+// so it works as a variable, a file name and in CredentialEnv.
+func ValidateCredentialName(name string) error {
+	if !credName.MatchString(name) {
+		return fmt.Errorf("credential name %q needs letters, digits and _ only, not starting with a digit", name)
+	}
+	return nil
+}
+
+// CredentialEnv is the variable a file credential's path comes in:
+// CONN3X_CRED_ and the name in upper case, so ssh_key is
+// CONN3X_CRED_SSH_KEY.
+func CredentialEnv(name string) string { return "CONN3X_CRED_" + strings.ToUpper(name) }
+
+// writeCredentials writes each file credential into a fresh directory only
+// this user can read, and returns the directory and the environment: NAME=value
+// for an env credential, CredentialEnv(NAME)=path for a file one.
+func writeCredentials(secrets []store.Secret) (dir string, env []string, err error) {
+	dir, err = os.MkdirTemp("", "conn3x-ui-cred-") // 0700
+	if err != nil {
+		return "", nil, err
+	}
+	for _, s := range secrets {
+		if err := ValidateCredentialName(s.Name); err != nil {
+			os.RemoveAll(dir)
+			return "", nil, err
+		}
+		if s.Kind == store.CredEnv {
+			env = append(env, s.Name+"="+string(s.Value))
+			continue
+		}
+		path := filepath.Join(dir, s.Name)
+		if err := os.WriteFile(path, s.Value, 0o600); err != nil {
+			os.RemoveAll(dir)
+			return "", nil, err
+		}
+		env = append(env, CredentialEnv(s.Name)+"="+path)
+	}
+	return dir, env, nil
+}
+
+// hider replaces each credential value with <hidden>: as it is, as JSON
+// writes it, and line by line, so a key printed in part is caught too.
+// It's a backstop; nothing in conn3x-ui prints a value on purpose.
+func hider(secrets []store.Secret) *strings.Replacer {
+	var olds []string
+	for _, s := range secrets {
+		v := string(s.Value)
+		olds = append(olds, v, jsonString(v, true), jsonString(v, false))
+		for _, l := range strings.Split(v, "\n") {
+			olds = append(olds, strings.TrimSpace(l))
+		}
+	}
+	// Longest first, so a whole value wins over one of its lines.
+	slices.SortFunc(olds, func(a, b string) int { return len(b) - len(a) })
+	var pairs []string
+	for _, o := range olds {
+		if o != "" {
+			pairs = append(pairs, o, "<hidden>")
+		}
+	}
+	return strings.NewReplacer(pairs...)
+}
+
+// jsonString is v as it appears inside a JSON string, with <, > and &
+// escaped as Go's encoding/json does by default, or not.
+func jsonString(v string, escapeHTML bool) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(escapeHTML)
+	enc.Encode(v)
+	q := strings.TrimSuffix(b.String(), "\n")
+	return q[1 : len(q)-1]
+}
+
+// scrub hides the run's credential values in s.
+func (r *Runner) scrub(id int64, s string) string {
+	r.mu.Lock()
+	h := r.hide[id]
+	r.mu.Unlock()
+	if h == nil {
+		return s
+	}
+	return h.Replace(s)
+}
+
 // ErrLocalState is a configuration without a remote backend.
 var ErrLocalState = errors.New("this configuration keeps its state in a local file, which would be lost with the run's temp directory. " +
 	"conn3x-ui needs a remote backend, such as s3, azurerm, gcs, pg or http. Add a backend block to the configuration and plan again")
@@ -174,7 +295,7 @@ var ErrLocalState = errors.New("this configuration keeps its state in a local fi
 // checkout clones p's ref into a fresh temp directory and, when sha is
 // set, moves to that commit instead of the ref's current head. It returns
 // the directory conn3x runs in, the commit, and how to remove it all.
-func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha string) (work, commit string, cleanup func(), err error) {
+func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha string, env []string) (work, commit string, cleanup func(), err error) {
 	tmp, err := os.MkdirTemp("", "conn3x-ui-run-")
 	if err != nil {
 		return "", "", nil, err
@@ -187,7 +308,7 @@ func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha st
 	repo := filepath.Join(tmp, "repo")
 
 	r.note(id, fmt.Sprintf("git clone --depth 1 --branch %s %s", p.GitRef, redactURL(p.GitURL)))
-	if out, err := r.git(ctx, "clone", "--quiet", "--depth", "1", "--branch", p.GitRef, "--", p.GitURL, repo); err != nil {
+	if out, err := r.git(ctx, env, "clone", "--quiet", "--depth", "1", "--branch", p.GitRef, "--", p.GitURL, repo); err != nil {
 		return "", "", nil, fmt.Errorf("git clone: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	if sha != "" {
@@ -195,14 +316,14 @@ func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha st
 			return "", "", nil, fmt.Errorf("the plan's commit %q isn't a commit ID", sha)
 		}
 		r.note(id, "git fetch --depth 1 origin "+sha)
-		if out, err := r.git(ctx, "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", sha); err != nil {
+		if out, err := r.git(ctx, env, "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", sha); err != nil {
 			return "", "", nil, fmt.Errorf("git fetch %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
 		}
-		if out, err := r.git(ctx, "-C", repo, "checkout", "--quiet", "--detach", sha); err != nil {
+		if out, err := r.git(ctx, env, "-C", repo, "checkout", "--quiet", "--detach", sha); err != nil {
 			return "", "", nil, fmt.Errorf("git checkout %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
 		}
 	}
-	head, err := r.git(ctx, "-C", repo, "rev-parse", "HEAD")
+	head, err := r.git(ctx, env, "-C", repo, "rev-parse", "HEAD")
 	if err != nil {
 		return "", "", nil, fmt.Errorf("git rev-parse: %v", err)
 	}
@@ -216,14 +337,14 @@ func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha st
 	return work, commit, func() { os.RemoveAll(tmp) }, nil
 }
 
-func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project) error {
-	work, _, cleanup, err := r.checkout(ctx, id, p, "")
+func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []string) error {
+	work, _, cleanup, err := r.checkout(ctx, id, p, "", env)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: p.EnvList(), Stderr: noteWriter{r, id}}
+	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
 	r.note(id, "conn3x init -input=false")
 	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
 		return fmt.Errorf("init: %w", err)
@@ -251,8 +372,8 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project) error {
 // doApply checks out the commit plan was made from and applies its saved
 // plan file. A plan that no longer matches the state is refused by conn3x
 // itself, and that error ends the run.
-func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan store.Run) error {
-	work, _, cleanup, err := r.checkout(ctx, id, p, plan.CommitSHA)
+func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan store.Run, env []string) error {
+	work, _, cleanup, err := r.checkout(ctx, id, p, plan.CommitSHA, env)
 	if err != nil {
 		return err
 	}
@@ -260,7 +381,7 @@ func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan st
 	if err := copyFile(r.PlanFile(plan.ID), filepath.Join(work, "plan.bin")); err != nil {
 		return fmt.Errorf("plan %d has no saved plan file: %w", plan.ID, err)
 	}
-	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: p.EnvList(), Stderr: noteWriter{r, id}}
+	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
 	r.note(id, "conn3x init -input=false")
 	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
 		return fmt.Errorf("init: %w", err)
@@ -309,14 +430,17 @@ func workDir(repo, path string) (string, error) {
 	return work, nil
 }
 
-func (r *Runner) git(ctx context.Context, args ...string) ([]byte, error) {
+// git runs git with the run's environment, so a project's credentials can
+// set GIT_SSH_COMMAND or GIT_CONFIG_* for its own repository.
+func (r *Runner) git(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	git := r.Git
 	if git == "" {
 		git = "git"
 	}
 	cmd := exec.CommandContext(ctx, git, args...)
-	// Never hang on a password or host-key prompt nobody can answer.
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o BatchMode=yes", "GIT_ALLOW_PROTOCOL=https:ssh:http")
+	// Never hang on a password or host-key prompt nobody can answer, and
+	// never let the environment widen the protocols, which ext:: would.
+	cmd.Env = append(append(append(os.Environ(), "GIT_SSH_COMMAND=ssh -o BatchMode=yes"), env...), "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL=https:ssh:http")
 	return cmd.CombinedOutput()
 }
 
@@ -375,6 +499,7 @@ func (r *Runner) note(id int64, msg string) {
 }
 
 func (r *Runner) emit(id int64, line []byte) error {
+	line = []byte(r.scrub(id, string(line)))
 	seq, err := r.Store.AppendEvent(context.Background(), id, line)
 	if err != nil {
 		r.Log.Printf("run %d: %v", id, err)

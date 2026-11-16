@@ -1,11 +1,14 @@
 // Copyright (c) The Conn3x Authors
 // SPDX-License-Identifier: MPL-2.0
 
-// Package store keeps projects, runs, users and sessions in one SQLite file.
+// Package store keeps projects, runs, users, sessions and credentials in
+// one SQLite file.
 package store
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/pbkdf2"
 	"crypto/rand"
@@ -83,11 +86,24 @@ var migrations = []string{
 		PRIMARY KEY (run_id, host)
 	);
 	CREATE INDEX run_hosts_host ON run_hosts(host, run_id);`,
+	// 4: each project's credentials, sealed with the key the UI reads at
+	// start. Names are unique whatever their case, since a file credential
+	// becomes an upper-case variable.
+	`CREATE TABLE credentials (
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		name TEXT NOT NULL COLLATE NOCASE,
+		kind TEXT NOT NULL,
+		value BLOB NOT NULL,
+		set_at TEXT NOT NULL,
+		PRIMARY KEY (project_id, name)
+	);`,
 }
 
 // Store is the database.
 type Store struct {
 	db *sql.DB
+	// aead seals credentials; nil until SetKey.
+	aead cipher.AEAD
 }
 
 // Open opens or creates the database at path and brings its schema up to
@@ -146,9 +162,8 @@ type Project struct {
 	GitRef     string
 	Path       string
 	Conn3xPath string
-	// Env is KEY=VALUE lines the runs get.
-	// shortcut: stored in plain text; #891 encrypts credentials with a key
-	// the UI reads at start.
+	// Env is KEY=VALUE lines the runs get, in plain text. Secrets go in
+	// the project's credentials instead.
 	Env       string
 	CreatedAt string
 	UpdatedAt string
@@ -461,6 +476,125 @@ func (s *Store) Events(ctx context.Context, runID int64) ([][]byte, int64, error
 		out = append(out, line)
 	}
 	return out, last, rows.Err()
+}
+
+// Credential kinds. A file credential reaches a run as a file in a private
+// temp directory, an env credential as an environment variable.
+const (
+	CredFile = "file"
+	CredEnv  = "env"
+)
+
+// Credential is a project's credential as the UI shows it: never its value.
+type Credential struct {
+	Name  string
+	Kind  string
+	SetAt string
+}
+
+// Secret is a credential with its value, for a run and nothing else.
+type Secret struct {
+	Name  string
+	Kind  string
+	Value []byte
+}
+
+// ErrNoKey is a credential read or written while the UI has no key.
+var ErrNoKey = errors.New("credentials need the key conn3x-ui reads at start. " +
+	"Make one with openssl rand -base64 32, then pass its file with -key-file or its value in CONN3X_UI_KEY")
+
+// SetKey sets the 32-byte key that seals credentials with AES-256-GCM.
+func (s *Store) SetKey(key []byte) error {
+	block, err := aes.NewCipher(key)
+	if err != nil || len(key) != 32 {
+		return errors.New("the credentials key must be 32 bytes")
+	}
+	s.aead, err = cipher.NewGCM(block)
+	return err
+}
+
+// HasKey says whether credentials can be saved and read.
+func (s *Store) HasKey() bool { return s.aead != nil }
+
+// credAD binds a sealed value to its row, so a value copied to another
+// project or name won't open.
+func credAD(projectID int64, name string) []byte {
+	return fmt.Appendf(nil, "%d\x00%s", projectID, name)
+}
+
+// SetCredential adds a credential to a project, or replaces the one with
+// that name, whatever its case.
+func (s *Store) SetCredential(ctx context.Context, projectID int64, name, kind string, value []byte) error {
+	if s.aead == nil {
+		return ErrNoKey
+	}
+	nonce := make([]byte, s.aead.NonceSize())
+	rand.Read(nonce)
+	sealed := s.aead.Seal(nonce, nonce, value, credAD(projectID, name))
+	_, err := s.db.ExecContext(ctx, "INSERT INTO credentials (project_id, name, kind, value, set_at) VALUES (?, ?, ?, ?, ?) "+
+		"ON CONFLICT (project_id, name) DO UPDATE SET name=excluded.name, kind=excluded.kind, value=excluded.value, set_at=excluded.set_at",
+		projectID, name, kind, sealed, now())
+	return err
+}
+
+// DeleteCredential removes a project's credential.
+func (s *Store) DeleteCredential(ctx context.Context, projectID int64, name string) error {
+	res, err := s.db.ExecContext(ctx, "DELETE FROM credentials WHERE project_id=? AND name=?", projectID, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Credentials returns a project's credentials by name, without values.
+func (s *Store) Credentials(ctx context.Context, projectID int64) ([]Credential, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT name, kind, set_at FROM credentials WHERE project_id=? ORDER BY name", projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Credential
+	for rows.Next() {
+		var c Credential
+		if err := rows.Scan(&c.Name, &c.Kind, &c.SetAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Secrets returns a project's credentials with their values opened, for a
+// run. A project with credentials and a UI without its key is ErrNoKey.
+func (s *Store) Secrets(ctx context.Context, projectID int64) ([]Secret, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT name, kind, value FROM credentials WHERE project_id=? ORDER BY name", projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Secret
+	for rows.Next() {
+		var c Secret
+		var sealed []byte
+		if err := rows.Scan(&c.Name, &c.Kind, &sealed); err != nil {
+			return nil, err
+		}
+		if s.aead == nil {
+			return nil, ErrNoKey
+		}
+		n := s.aead.NonceSize()
+		if len(sealed) < n {
+			return nil, fmt.Errorf("credential %s is damaged", c.Name)
+		}
+		if c.Value, err = s.aead.Open(nil, sealed[:n], sealed[n:], credAD(projectID, c.Name)); err != nil {
+			return nil, fmt.Errorf("credential %s won't open: conn3x-ui was started with a different key from the one it was saved with, or the row was changed", c.Name)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // User is someone who can sign in.

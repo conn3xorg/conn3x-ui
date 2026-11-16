@@ -4,10 +4,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -222,6 +225,75 @@ func TestSessions(t *testing.T) {
 	s.Logout(ctx, tok)
 	if _, _, err := s.Session(ctx, tok); !errors.Is(err, ErrNotFound) {
 		t.Error("session outlived logout")
+	}
+}
+
+func TestCredentials(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	pid, _ := s.CreateProject(ctx, Project{Name: "p"})
+	other, _ := s.CreateProject(ctx, Project{Name: "q"})
+	if err := s.SetCredential(ctx, pid, "token", CredEnv, []byte("x")); !errors.Is(err, ErrNoKey) {
+		t.Errorf("set without a key: %v", err)
+	}
+	if err := s.SetKey([]byte("short")); err == nil {
+		t.Error("short key accepted")
+	}
+	key := make([]byte, 32)
+	rand.Read(key)
+	if err := s.SetKey(key); err != nil {
+		t.Fatal(err)
+	}
+	s.SetCredential(ctx, pid, "ssh_key", CredFile, []byte("old key\n"))
+	s.SetCredential(ctx, pid, "SSH_KEY", CredFile, []byte("key one\n")) // same name, other case: replaces
+	s.SetCredential(ctx, pid, "TOKEN", CredEnv, []byte("tok-1"))
+	s.SetCredential(ctx, other, "TOKEN", CredEnv, []byte("tok-2"))
+
+	creds, err := s.Credentials(ctx, pid)
+	if err != nil || len(creds) != 2 || creds[0].Name != "SSH_KEY" || creds[0].Kind != CredFile || creds[0].SetAt == "" {
+		t.Fatalf("%+v %v", creds, err)
+	}
+	secrets, err := s.Secrets(ctx, pid)
+	if err != nil || len(secrets) != 2 || string(secrets[0].Value) != "key one\n" || string(secrets[1].Value) != "tok-1" {
+		t.Fatalf("%+v %v", secrets, err)
+	}
+	var raw []byte
+	s.db.QueryRow("SELECT value FROM credentials WHERE project_id=? AND name='TOKEN'", pid).Scan(&raw)
+	if bytes.Contains(raw, []byte("tok-1")) {
+		t.Error("value stored in plain text")
+	}
+
+	// A value moved to another project's row doesn't open there.
+	s.db.Exec("UPDATE credentials SET value=? WHERE project_id=? AND name='TOKEN'", raw, other)
+	if _, err := s.Secrets(ctx, other); err == nil || strings.Contains(err.Error(), "tok") {
+		t.Errorf("swapped value: %v", err)
+	}
+	s.DeleteCredential(ctx, other, "token")
+
+	// Nor does anything under a different key, and no key at all says how
+	// to make one.
+	rand.Read(key)
+	s.SetKey(key)
+	if _, err := s.Secrets(ctx, pid); err == nil || !strings.Contains(err.Error(), "different key") {
+		t.Errorf("wrong key: %v", err)
+	}
+	s.aead = nil
+	if _, err := s.Secrets(ctx, pid); !errors.Is(err, ErrNoKey) || !strings.Contains(err.Error(), "openssl rand -base64 32") {
+		t.Errorf("no key: %v", err)
+	}
+	if secrets, err := s.Secrets(ctx, other); err != nil || len(secrets) != 0 {
+		t.Errorf("a project without credentials needs no key: %v", err)
+	}
+
+	if err := s.DeleteCredential(ctx, pid, "token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteCredential(ctx, pid, "token"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("delete missing: %v", err)
+	}
+	s.DeleteProject(ctx, pid)
+	if creds, _ := s.Credentials(ctx, pid); len(creds) != 0 {
+		t.Errorf("credentials outlived their project: %+v", creds)
 	}
 }
 
