@@ -5,9 +5,12 @@ package run
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
 
 	conn3xexec "github.com/conn3xorg/conn3x-exec"
+
+	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
 
 // Result is a plan's or an apply's stream arranged for a page: hosts, then
@@ -38,8 +41,9 @@ type Step struct {
 
 // Action is one planned change, or one applied in an apply. Outcome is
 // "ok" or "failed" for an apply, with how long the step took, and "" for
-// a plan.
+// a plan. Host is set for drift, which isn't grouped by host.
 type Action struct {
+	Host    string
 	Addr    string
 	Item    string
 	Action  string
@@ -72,14 +76,30 @@ func (h Host) Outcome() string {
 	return out
 }
 
-// HostOutcomes is each named host's Outcome, for the run history.
+// HostOutcomes is each named host's Outcome, for the run history, and
+// "drift" for a host that only drifted.
 func (r Result) HostOutcomes() map[string]string {
 	out := map[string]string{}
+	for _, h := range r.DriftedHosts() {
+		out[h] = store.OutcomeDrift
+	}
 	for _, h := range r.Hosts {
 		if h.Name != "" {
 			out[h.Name] = h.Outcome()
 		}
 	}
+	return out
+}
+
+// DriftedHosts is each named host with drift, by name.
+func (r Result) DriftedHosts() []string {
+	var out []string
+	for _, a := range r.Drift {
+		if a.Host != "" && !slices.Contains(out, a.Host) {
+			out = append(out, a.Host)
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -162,7 +182,7 @@ func Group(lines [][]byte) Result {
 func action(c *conn3xexec.Change) Action {
 	a := Action{Addr: c.Resource.Addr, Action: c.Action, Reason: c.Reason}
 	if c.Resource.Step != nil {
-		a.Item = c.Resource.Step.Item
+		a.Host, a.Item = c.Resource.Step.Host, c.Resource.Step.Item
 	}
 	return a
 }

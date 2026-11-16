@@ -118,12 +118,42 @@ The report is kept beside the plan, under `DATA/runs/ID/`, and the apply's page 
 
 **Runs** at the top lists every run across projects, newest first: who started it, when, the commit, the Conn3x version and how it ended. Filter by project, host and outcome. Each run's page shows who started and who approved it, and each host's steps with how it came out there.
 
+## Drift checks
+
+Somebody fixed a host by hand at 2am, and the state doesn't know. A drift check finds out for you. Give a project a **drift check schedule** in its settings:
+
+- an interval, such as `1h`, `6h` or `24h`, or
+- five cron fields in UTC, minute hour day month weekday, such as `0 3 * * 1-5` for 03:00 on weekdays. Each field takes `*`, numbers, ranges like `1-5`, lists like `1,15`, and steps like `*/15`.
+
+When a check is due, the UI queues it like any other run, so one run at a time per project still holds. A check clones the ref, runs `conn3x init -input=false`, then `conn3x plan -refresh-only -detailed-exitcode -input=false` with `-json`. Nothing is planned or applied. Exit 2 means a host no longer matches the state, and the run ends `drift`; exit 0 ends it `clean`. Both show in **Runs**, where the outcome filter takes `drift` and `clean`, and the host filter finds the hosts that drifted.
+
+When is a check due? One interval, or the next cron slot, after the last check started. That survives a restart: a UI that was down past a slot runs the check once when it starts, not once for every slot it missed. A project's first check comes one slot after the schedule was saved.
+
+Add a **drift webhook** to hear about it. When a check finds drift, or fails, the UI POSTs this, with a 10-second timeout:
+
+```json
+{
+  "project": "web",
+  "run_id": 42,
+  "status": "succeeded",
+  "outcome": "drift",
+  "link": "/runs/42",
+  "hosts": ["web1"],
+  "time": "2026-11-16T03:00:41Z",
+  "text": "Conn3x: web drifted on web1 (run 42)"
+}
+```
+
+`link` is the run's path on the UI; put your UI's address in front. `text` is a one-line summary, for chat webhooks that read a `text` field. A failed check has `"status": "failed"` and an empty `outcome`. If the webhook fails, the log says so and the run stands as it ended.
+
+The URL must be `http://` or `https://`. Webhook URLs often carry a token, so once saved the page shows only the host, and the log never prints it. Leave the field blank to keep the saved one, or tick **Remove the webhook**.
+
 ## Not here yet
 
 The rest of the design, in the order it's planned:
 
 - OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Until then the one admin may apply any plan; the approver role and the "planners may apply their own plan" setting come with the roles.
-- Scheduled drift checks: [#893](https://github.com/conn3xorg/conn3x/issues/893)
+- Drift notifications by email, and a Check drift button: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - apt, dnf, Homebrew and Scoop packages, and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries and the image are in.
 
 Credentials are in, with the key from a file or a variable; a KMS for the key comes later, also under [#891](https://github.com/conn3xorg/conn3x/issues/891).

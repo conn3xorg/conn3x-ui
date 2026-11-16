@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cgi"
 	"net/http/cookiejar"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/conn3xorg/conn3x-ui/internal/run"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
@@ -55,7 +57,9 @@ func waitForInterrupt(ch chan os.Signal) {
 // state local, "stale" refuses the apply the way a stale plan is refused,
 // "hang" makes the plan wait for an interrupt, "creds" prints the
 // credentials it was given and fails with one in its error. An apply writes its stream
-// to -json-into and a report to -report, as a real one does.
+// to -json-into and a report to -report, as a real one does. A plan
+// -refresh-only finds nothing, except in "drift", where web1 drifted and,
+// with -detailed-exitcode, it exits 2.
 func TestMain(m *testing.M) {
 	mode := os.Getenv("CONN3X_FAKE")
 	if mode == "" {
@@ -84,6 +88,15 @@ func TestMain(m *testing.M) {
 			os.WriteFile(".terraform/terraform.tfstate", []byte(`{"version":3,"backend":{"type":"http"}}`), 0o644)
 		}
 	case "plan":
+		if slices.Contains(os.Args, "-refresh-only") {
+			if mode == "drift" {
+				fmt.Println(strings.Replace(changeLine("web1", "build", "update"), "planned_change", "resource_drift", 1))
+				if slices.Contains(os.Args, "-detailed-exitcode") {
+					os.Exit(2)
+				}
+			}
+			return
+		}
 		if mode == "hang" {
 			waitForInterrupt(interrupt)
 		}
@@ -757,5 +770,167 @@ func TestPagesCantBeFramed(t *testing.T) {
 	resp.Body.Close()
 	if resp.Header.Get("X-Frame-Options") != "DENY" || !strings.Contains(resp.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
 		t.Errorf("headers %v", resp.Header)
+	}
+}
+
+func TestDriftChecks(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	var mu sync.Mutex
+	got := map[string]run.Notification{}
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n run.Notification
+		json.NewDecoder(r.Body).Decode(&n)
+		mu.Lock()
+		got[n.Project] = n
+		mu.Unlock()
+		if strings.Contains(r.URL.Path, "fail") {
+			w.WriteHeader(500)
+		}
+	}))
+	defer hook.Close()
+	var logged strings.Builder
+	e.runner.Log = log.New(&syncWriter{w: &logged}, "", 0)
+	ctx := context.Background()
+	add := func(name, fake, schedule, hookPath string) int64 {
+		id, err := e.st.CreateProject(ctx, store.Project{Name: name, GitURL: repo, GitRef: "main", Path: ".", Conn3xPath: exe, Env: "CONN3X_FAKE=" + fake,
+			Schedule: schedule, WebhookURL: hook.URL + hookPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	drifted := add("drifted", "drift", "1h", "/T000/SECRET")
+	steady := add("steady", "plan", "1h", "/T000/SECRET")
+	broken := add("broken", "local", "0 * * * *", "/fail/SECRET")
+	unscheduled := add("unscheduled", "drift", "", "/T000/SECRET")
+
+	e.runner.Tick(ctx, time.Now().Add(2*time.Hour))
+	e.runner.Wait()
+	last := func(pid int64) store.Run {
+		t.Helper()
+		rn, err := e.st.LastRun(ctx, pid, store.KindDrift)
+		if err != nil {
+			t.Fatalf("project %d: %v", pid, err)
+		}
+		return rn
+	}
+	if rn := last(drifted); rn.Status != store.StatusSucceeded || rn.Outcome != store.OutcomeDrift || rn.CreatedBy.Valid {
+		t.Errorf("drifted: %+v", rn)
+	}
+	if rn := last(steady); rn.Status != store.StatusSucceeded || rn.Outcome != store.OutcomeClean {
+		t.Errorf("steady: %+v", rn)
+	}
+	if rn := last(broken); rn.Status != store.StatusFailed || rn.Outcome != "" {
+		t.Errorf("broken: %+v", rn)
+	}
+	if _, err := e.st.LastRun(ctx, unscheduled, store.KindDrift); err == nil {
+		t.Error("a project without a schedule was checked")
+	}
+
+	// Drift and a failed check are posted; a clean one isn't. A webhook
+	// that fails is logged without its URL.
+	driftRun := last(drifted).ID
+	if n := got["drifted"]; n.RunID != driftRun || n.Outcome != "drift" || n.Status != "succeeded" || n.Link != fmt.Sprintf("/runs/%d", driftRun) ||
+		fmt.Sprint(n.Hosts) != "[web1]" || n.Time.IsZero() || !strings.Contains(n.Text, "drifted on web1") {
+		t.Errorf("drift notification %+v", n)
+	}
+	if n := got["broken"]; n.Status != "failed" || n.RunID != last(broken).ID {
+		t.Errorf("failure notification %+v", n)
+	}
+	if _, ok := got["steady"]; ok || len(got) != 2 {
+		t.Errorf("notifications %+v", got)
+	}
+	if l := logged.String(); !strings.Contains(l, "webhook answered 500") || strings.Contains(l, "SECRET") {
+		t.Errorf("log:\n%s", l)
+	}
+
+	// Just checked, so nothing is due now.
+	e.runner.Tick(ctx, time.Now())
+	e.runner.Wait()
+	if rn := last(drifted); rn.ID != driftRun {
+		t.Errorf("checked again at once: %+v", rn)
+	}
+
+	e.login(t)
+	_, body := e.get(fmt.Sprintf("/runs/%d", driftRun))
+	for _, want := range []string{"<h1>Drift check", "started by the schedule", `<span class="status drift">drift</span>`, "Drift since the last apply", "<td>web1</td>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("drift run page lacks %q:\n%s", want, body)
+		}
+	}
+	if _, body := e.get(fmt.Sprintf("/runs/%d", last(steady).ID)); !strings.Contains(body, "No drift.") {
+		t.Errorf("clean run page:\n%s", body)
+	}
+	for query, want := range map[string]int64{"?status=drift": driftRun, "?status=clean": last(steady).ID, "?host=web1&status=drift": driftRun} {
+		_, body := e.get("/runs" + query)
+		if n := strings.Count(body, `<a href="/runs/`); n != 1 || !strings.Contains(body, fmt.Sprintf(`<a href="/runs/%d">`, want)) {
+			t.Errorf("%s: %d runs:\n%s", query, n, body)
+		}
+	}
+}
+
+// syncWriter lets runs log from their goroutines while a test reads.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(b)
+}
+
+func TestDriftSettings(t *testing.T) {
+	e := setup(t)
+	e.login(t)
+	project := e.createProject(t, "web", "https://example.com/r.git", ".", "conn3x", "")
+	const hookURL = "https://hooks.example.com/services/T000/SECRET"
+	save := func(extra url.Values) (*http.Response, string) {
+		form := url.Values{"csrf": {e.csrf(project)}, "name": {"web"}, "git_url": {"https://example.com/r.git"}}
+		for k, v := range extra {
+			form[k] = v
+		}
+		resp, err := e.PostForm(e.base+project, form)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, string(body)
+	}
+	saved := func() store.Project {
+		p, _ := e.st.Project(context.Background(), runID(t, project))
+		return p
+	}
+
+	if resp, _ := save(url.Values{"schedule": {" 0  3 * * 1-5 "}, "webhook_url": {hookURL}}); resp.StatusCode != 303 {
+		t.Fatalf("save: %d", resp.StatusCode)
+	}
+	if p := saved(); p.Schedule != "0 3 * * 1-5" || p.WebhookURL != hookURL {
+		t.Errorf("%+v", p)
+	}
+	_, body := e.get(project)
+	if !strings.Contains(body, `value="0 3 * * 1-5"`) || !strings.Contains(body, "One is set, to hooks.example.com") || strings.Contains(body, "SECRET") {
+		t.Errorf("project page:\n%s", body)
+	}
+
+	// A blank field keeps the webhook; bad values are refused and the
+	// page that says so doesn't show it either.
+	if resp, _ := save(url.Values{"schedule": {"6h"}}); resp.StatusCode != 303 || saved().WebhookURL != hookURL || saved().Schedule != "6h" {
+		t.Errorf("blank webhook: %d %+v", resp.StatusCode, saved())
+	}
+	for _, bad := range []url.Values{{"schedule": {"daily"}}, {"schedule": {"10s"}}, {"webhook_url": {"ftp://example.com/x"}}} {
+		if resp, body := save(bad); resp.StatusCode != 400 || strings.Contains(body, "SECRET") {
+			t.Errorf("%v: %d", bad, resp.StatusCode)
+		}
+	}
+	if resp, _ := save(url.Values{"webhook_clear": {"1"}}); resp.StatusCode != 303 || saved().WebhookURL != "" || saved().Schedule != "" {
+		t.Errorf("clear: %d %+v", resp.StatusCode, saved())
+	}
+	if resp := e.post(project, url.Values{"name": {"web"}, "git_url": {"https://example.com/r.git"}, "schedule": {"1h"}}); resp.StatusCode != 403 {
+		t.Errorf("save without CSRF: %d", resp.StatusCode)
 	}
 }

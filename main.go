@@ -98,6 +98,8 @@ func serve(listen, data, keyFile string) error {
 		log.Printf("created the admin account. Sign in as admin with the password %s", password)
 	}
 	runner := run.New(ctx, st, data)
+	scheduled := make(chan struct{})
+	go func() { runner.Schedule(ctx); close(scheduled) }()
 	srv := &http.Server{Addr: listen, Handler: web.New(st, runner), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -109,6 +111,7 @@ func serve(listen, data, keyFile string) error {
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	<-scheduled   // so no drift check starts after Wait
 	runner.Wait() // conn3x got the interrupt too; let it release its locks
 	return nil
 }

@@ -36,8 +36,8 @@ type Line struct {
 	Done bool
 }
 
-// Runner runs plans and applies. One at a time per project; the rest
-// queue.
+// Runner runs plans, applies and drift checks. One at a time per project;
+// the rest queue.
 type Runner struct {
 	Store   *store.Store
 	DataDir string
@@ -100,6 +100,21 @@ func (r *Runner) StartApply(ctx context.Context, plan store.Run, p store.Project
 	return id, nil
 }
 
+// StartDrift queues a drift check of p, started by its schedule, and
+// returns the run's ID at once. When the check finds drift or fails, p's
+// webhook hears about it.
+func (r *Runner) StartDrift(ctx context.Context, p store.Project) (int64, error) {
+	id, err := r.Store.CreateRun(ctx, p.ID, store.KindDrift, 0)
+	if err != nil {
+		return 0, err
+	}
+	r.wg.Go(func() {
+		r.run(id, p, func(ctx context.Context, env []string) error { return r.doDrift(ctx, id, p, env) })
+		r.notify(id, p)
+	})
+	return id, nil
+}
+
 // ErrCancelled is why a run's context ended when somebody pressed Cancel.
 var ErrCancelled = errors.New("cancelled")
 
@@ -152,8 +167,8 @@ func (r *Runner) run(id int64, p store.Project, do func(ctx context.Context, env
 	status, msg := store.StatusSucceeded, ""
 	env, cleanup, err := r.credentials(id, p)
 	if err == nil {
-		defer cleanup() // success, failure and cancel alike
 		err = do(ctx, append(p.EnvList(), env...))
+		cleanup() // success, failure and cancel alike, before anyone hears it's done
 	}
 	if err != nil && context.Cause(ctx) == ErrCancelled {
 		status = store.StatusCancelled
@@ -367,6 +382,37 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 		return err
 	}
 	return copyFile(filepath.Join(work, "plan.bin"), r.PlanFile(id))
+}
+
+// doDrift refreshes the state against the hosts without planning any
+// change. -detailed-exitcode makes conn3x exit 2 when something drifted.
+func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []string) error {
+	work, _, cleanup, err := r.checkout(ctx, id, p, "", env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
+	r.note(id, "conn3x init -input=false")
+	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	if t, err := backendType(work); err != nil {
+		return err
+	} else if t == "local" {
+		return ErrLocalState
+	}
+	r.note(id, "conn3x plan -refresh-only -detailed-exitcode -input=false")
+	outcome := store.OutcomeClean
+	err = c.Run(ctx, r.record(id), "plan", "-refresh-only", "-detailed-exitcode", "-input=false")
+	var exit *conn3xexec.ExitError
+	if errors.As(err, &exit) && exit.Code == 2 {
+		outcome, err = store.OutcomeDrift, nil
+	}
+	if err != nil {
+		return fmt.Errorf("plan: %w", err)
+	}
+	return r.Store.SetRunOutcome(context.Background(), id, outcome)
 }
 
 // doApply checks out the commit plan was made from and applies its saved

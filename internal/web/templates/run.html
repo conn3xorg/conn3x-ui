@@ -1,6 +1,6 @@
 {{define "title"}}Run {{.Data.Run.ID}} · {{.Data.Project.Name}}{{end}}
 {{define "content"}}
-<h1>{{if eq .Data.Run.Kind "apply"}}Apply{{else}}Plan{{end}} {{.Data.Run.ID}} · <a href="/projects/{{.Data.Project.ID}}">{{.Data.Project.Name}}</a></h1>
+<h1>{{if eq .Data.Run.Kind "apply"}}Apply{{else if eq .Data.Run.Kind "drift"}}Drift check{{else}}Plan{{end}} {{.Data.Run.ID}} · <a href="/projects/{{.Data.Project.ID}}">{{.Data.Project.Name}}</a></h1>
 {{template "status" .}}
 <h2>Output</h2>
 <pre id="log">{{range .Data.Lines}}{{lineText .}}
@@ -18,8 +18,8 @@
 {{define "status"}}
 <div id="status" {{if not .Data.Run.Finished}}hx-get="/runs/{{.Data.Run.ID}}/status" hx-trigger="every 2s, refresh" hx-swap="outerHTML"{{end}}>
   <p>
-    <span class="status {{.Data.Run.Status}}">{{.Data.Run.Status}}</span>
-    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else}}a removed user{{end}}
+    <span class="status {{.Data.Run.Status}}">{{.Data.Run.Status}}</span>{{with .Data.Run.Outcome}} · <span class="status {{.}}">{{.}}</span>{{end}}
+    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else if eq .Data.Run.Kind "drift"}}the schedule{{else}}a removed user{{end}}
     {{if .Data.Run.CommitSHA}} · commit <span class="act">{{printf "%.10s" .Data.Run.CommitSHA}}</span>{{end}}
     {{if .Data.Run.Conn3xVersion}} · Conn3x {{.Data.Run.Conn3xVersion}}{{end}}
     {{if .Data.Run.StartedAt.Valid}} · started {{.Data.Run.StartedAt.String}}{{end}}
@@ -57,9 +57,10 @@
     {{end}}
     {{if .Drift}}
     <h3>Drift since the last apply</h3>
-    <table>{{range .Drift}}<tr><td class="act">{{.Addr}}</td><td class="act">{{.Action}}</td></tr>{{end}}</table>
+    <table>{{range .Drift}}<tr><td>{{.Host}}</td><td class="act">{{.Addr}}</td><td class="act">{{.Action}}</td></tr>{{end}}</table>
     {{end}}
     {{if and (not .Hosts) (not .Diagnostics) (eq $.Data.Run.Status "succeeded") (eq $.Data.Run.Kind "plan")}}<p>No changes. Every host already matches its circuits.</p>{{end}}
+    {{if eq $.Data.Run.Outcome "clean"}}<p>No drift. Every host still matches the state.</p>{{end}}
   {{end}}
 </div>
 {{end}}
