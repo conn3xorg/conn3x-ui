@@ -6,9 +6,47 @@ It's one binary. It runs the `conn3x` CLI as a child process for every run and r
 
 This is the second slice of the design in [conn3xorg/conn3x#525](https://github.com/conn3xorg/conn3x/issues/525). Expect it to change.
 
+## Install
+
+Each [release](https://github.com/conn3xorg/conn3x-ui/releases) has a binary for Linux, macOS and Windows on amd64 and arm64. Download the archive for your platform, unpack it, and put `conn3x-ui` on your PATH. It still needs `git` and a `conn3x` binary beside it.
+
+Or run the container image, which has both, plus an ssh client for `git@` URLs:
+
+```sh
+docker run -d --name conn3x-ui -v ui-data:/data -p 127.0.0.1:8080:8080 \
+  ghcr.io/conn3xorg/conn3x-ui:vX.Y.Z serve -listen 0.0.0.0:8080 -data /data
+docker logs conn3x-ui   # the admin password
+```
+
+`-listen 0.0.0.0:8080` is inside the container; `-p 127.0.0.1:8080:8080` keeps it on your machine. Publish it wider only with TLS in front, as [below](#run-it). The image runs as UID 65532, so a named volume just works; a host directory for `/data` must be writable by that UID. Add the key with `-e CONN3X_UI_KEY` or a mounted `-key-file`.
+
+The image carries the `conn3x` that was current when it was built. Want a project on a different one? Mount that binary into the container and give the project its path.
+
+### Verify a download
+
+`checksums.txt` is signed with [Sigstore](https://www.sigstore.dev/), keyless, by the release workflow. Check the signature, then the file you downloaded:
+
+```sh
+cosign verify-blob \
+  --certificate-identity 'https://github.com/conn3xorg/conn3x-ui/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --bundle checksums.txt.sigstore.json checksums.txt
+sha256sum --check --ignore-missing checksums.txt
+```
+
+And the image:
+
+```sh
+cosign verify ghcr.io/conn3xorg/conn3x-ui:vX.Y.Z \
+  --certificate-identity 'https://github.com/conn3xorg/conn3x-ui/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Each release also has SBOMs and a build provenance attestation: `gh attestation verify conn3x-ui_VERSION_linux_amd64.tar.gz --repo conn3xorg/conn3x-ui`.
+
 ## Run it
 
-You need Go 1.27, `git` on PATH, and a `conn3x` binary.
+To build it yourself, you need Go 1.27, `git` on PATH, and a `conn3x` binary.
 
 ```sh
 go build -o conn3x-ui .
@@ -86,7 +124,7 @@ The rest of the design, in the order it's planned:
 
 - OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Until then the one admin may apply any plan; the approver role and the "planners may apply their own plan" setting come with the roles.
 - Scheduled drift checks: [#893](https://github.com/conn3xorg/conn3x/issues/893)
-- Releases, a container image and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894)
+- apt, dnf, Homebrew and Scoop packages, and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries and the image are in.
 
 Credentials are in, with the key from a file or a variable; a KMS for the key comes later, also under [#891](https://github.com/conn3xorg/conn3x/issues/891).
 

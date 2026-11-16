@@ -1,0 +1,110 @@
+# Copyright (c) The Conn3x Authors
+# SPDX-License-Identifier: MPL-2.0
+#
+# Releases are cut by .github/workflows/release.yml, which runs this as a
+# draft that a maintainer reviews and publishes. Try it locally with
+#   goreleaser release --snapshot --clean --skip=publish,sign,sbom
+version: 2
+project_name: conn3x-ui
+
+builds:
+  - id: conn3x-ui
+    main: .
+    binary: conn3x-ui
+    # modernc.org/sqlite is pure Go, so every target builds without cgo.
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+    artifacts: checksum
+
+# Keyless, as for checksums.txt: the signature names the release workflow
+# and is stored in the registry beside the image.
+docker_signs:
+  - cmd: cosign
+    args: ["sign", "${artifact}@${digest}", "--yes"]
+
+dockers_v2:
+  - images:
+      - ghcr.io/conn3xorg/conn3x-ui
+    tags:
+      - "v{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    dockerfile: release.Containerfile
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: conn3x-ui
+      org.opencontainers.image.description: A web UI for Conn3x. Plan from the browser, apply exactly that plan.
+      org.opencontainers.image.source: "{{ .GitURL }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: MPL-2.0
+
+changelog:
+  sort: asc
+  use: github
+  format: "{{ .Message }}"
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other changes
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: true
+  replace_existing_draft: true
+  footer: |
+    Verify a download:
+
+    ```sh
+    cosign verify-blob \
+      --certificate-identity 'https://github.com/conn3xorg/conn3x-ui/.github/workflows/release.yml@refs/heads/main' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --bundle checksums.txt.sigstore.json checksums.txt
+    sha256sum --check --ignore-missing checksums.txt
+    ```
+
+    Verify the container image:
+
+    ```sh
+    cosign verify ghcr.io/conn3xorg/conn3x-ui:v{{ .Version }} \
+      --certificate-identity 'https://github.com/conn3xorg/conn3x-ui/.github/workflows/release.yml@refs/heads/main' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    ```
