@@ -1,7 +1,8 @@
 // Copyright (c) The Conn3x Authors
 // SPDX-License-Identifier: MPL-2.0
 
-// Package web is the HTTP side: pages, forms, sign-in and the event stream.
+// Package web is the HTTP side: pages, forms, sign-in, roles, the audit log
+// and the event stream.
 package web
 
 import (
@@ -69,8 +70,8 @@ type page struct {
 // New builds the handler.
 func New(st *store.Store, rn *run.Runner) *Server {
 	s := &Server{Store: st, Runner: rn, Log: log.Default(), pages: map[string]*template.Template{}, mux: http.NewServeMux()}
-	for _, name := range []string{"login", "projects", "project", "run", "runs"} {
-		s.pages[name] = template.Must(template.New("").Funcs(template.FuncMap{"lineText": lineText, "credEnv": run.CredentialEnv}).
+	for _, name := range []string{"login", "projects", "project", "run", "runs", "users", "account", "audit", "forbidden"} {
+		s.pages[name] = template.Must(template.New("").Funcs(template.FuncMap{"lineText": lineText, "credEnv": run.CredentialEnv, "atLeast": store.RoleAtLeast, "roles": func() []string { return store.Roles }}).
 			ParseFS(files, "templates/layout.html", "templates/project_form.html", "templates/"+name+".html"))
 	}
 	s.mux.Handle("GET /static/", http.FileServerFS(files))
@@ -85,6 +86,7 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /projects/{id}/plan", s.startPlan)
 	s.mux.HandleFunc("POST /projects/{id}/credentials", s.setCredential)
 	s.mux.HandleFunc("POST /projects/{id}/credentials/{name}/delete", s.deleteCredential)
+	s.mux.HandleFunc("POST /projects/{id}/roles", s.setRole)
 	s.mux.HandleFunc("GET /runs", s.history)
 	s.mux.HandleFunc("GET /runs/{id}", s.runPage)
 	s.mux.HandleFunc("GET /runs/{id}/report", s.runReport)
@@ -92,12 +94,20 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /runs/{id}/cancel", s.cancelRun)
 	s.mux.HandleFunc("GET /runs/{id}/status", s.runStatus)
 	s.mux.HandleFunc("GET /runs/{id}/events", s.runEvents)
+	s.mux.HandleFunc("GET /users", s.users)
+	s.mux.HandleFunc("POST /users", s.createUser)
+	s.mux.HandleFunc("POST /users/{id}", s.updateUser)
+	s.mux.HandleFunc("POST /users/{id}/password", s.resetPassword)
+	s.mux.HandleFunc("GET /account", s.account)
+	s.mux.HandleFunc("POST /account/password", s.changePassword)
+	s.mux.HandleFunc("GET /audit", s.auditPage)
 	return s
 }
 
-// ServeHTTP signs the request in and checks CSRF, then routes it.
-// shortcut: one local admin and a session cookie stand in for #892's OIDC
-// sign-in and roles.
+// ServeHTTP signs the request in and checks CSRF, then routes it. Each
+// handler checks the user's role itself.
+// shortcut: local accounts and a session cookie; OIDC sign-in is the rest
+// of #892.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// No page may be framed, so a button can't be clicked through an overlay.
 	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
@@ -176,6 +186,58 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request, page_, tmpl str
 	}
 }
 
+// forbid answers 403 with a page that says why.
+func (s *Server) forbid(w http.ResponseWriter, r *http.Request, why string) {
+	s.render(w, r, "forbidden", http.StatusForbidden, why, "")
+}
+
+// role is the user's role on a project: admin for a site admin, "" for
+// someone with none.
+func (s *Server) role(r *http.Request, projectID int64) (string, error) {
+	if u := sess(r).user; u.Admin {
+		return store.RoleAdmin, nil
+	}
+	return s.Store.Role(r.Context(), projectID, sess(r).user.ID)
+}
+
+// allowed loads a project and the user's role on it. When the role is
+// below want, it answers 403 and returns false, as it does when the
+// project can't be loaded.
+func (s *Server) allowed(w http.ResponseWriter, r *http.Request, projectID int64, want string) (store.Project, string, bool) {
+	p, err := s.Store.Project(r.Context(), projectID)
+	if err != nil {
+		s.fail(w, err)
+		return p, "", false
+	}
+	role, err := s.role(r, p.ID)
+	if err != nil {
+		s.fail(w, err)
+		return p, "", false
+	}
+	if !store.RoleAtLeast(role, want) {
+		s.forbid(w, r, fmt.Sprintf("That needs the %s role on %s. A project admin can give it to you.", want, p.Name))
+		return p, role, false
+	}
+	return p, role, true
+}
+
+// siteAdmin answers 403 and returns false unless the user is a site admin.
+func (s *Server) siteAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if !sess(r).user.Admin {
+		s.forbid(w, r, "Only a site admin can do that.")
+		return false
+	}
+	return true
+}
+
+// audit appends an action to the audit log. A failed write is logged, not
+// shown: the action has happened already.
+func (s *Server) audit(ctx context.Context, u store.User, p store.Project, action, detail string) {
+	if err := s.Store.Audit(ctx, store.Entry{UserID: u.ID, UserName: u.Name, ProjectID: p.ID, ProjectName: p.Name, Action: action, Detail: detail}); err != nil {
+		s.Log.Printf("audit %s: %v", action, err)
+	}
+}
+
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -192,8 +254,19 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	tok, _, err := s.Store.Login(r.Context(), r.PostFormValue("name"), r.PostFormValue("password"), sessionTTL)
+	name := r.PostFormValue("name")
+	tok, _, err := s.Store.Login(r.Context(), name, r.PostFormValue("password"), sessionTTL)
+	// Only a name somebody has goes in the log, so a password typed into
+	// the name field doesn't.
+	u, uerr := s.Store.UserNamed(r.Context(), name)
 	if errors.Is(err, store.ErrNotFound) {
+		why := "wrong password"
+		if uerr != nil {
+			why, u = "unknown name", store.User{}
+		} else if u.Disabled {
+			why = "disabled user"
+		}
+		s.audit(r.Context(), u, store.Project{}, "sign-in failed", why)
 		w.WriteHeader(http.StatusUnauthorized)
 		s.pages["login"].ExecuteTemplate(w, "layout", page{CSRF: cookie(r, "csrf"), Error: "That name and password don't match."})
 		return
@@ -202,18 +275,29 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r.Context(), u, store.Project{}, "sign-in", "")
 	setCookie(w, r, "session", tok, sessionTTL)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	s.Store.Logout(r.Context(), sess(r).token)
+	s.audit(r.Context(), sess(r).user, store.Project{}, "sign-out", "")
 	setCookie(w, r, "session", "", -1)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
+// visibleProjects is every project for a site admin, and the ones the
+// user has a role on for anyone else.
+func (s *Server) visibleProjects(r *http.Request) ([]store.Project, error) {
+	if u := sess(r).user; !u.Admin {
+		return s.Store.MemberProjects(r.Context(), u.ID)
+	}
+	return s.Store.Projects(r.Context())
+}
+
 func (s *Server) projects(w http.ResponseWriter, r *http.Request) {
-	ps, err := s.Store.Projects(r.Context())
+	ps, err := s.visibleProjects(r)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -268,10 +352,14 @@ func projectForm(r *http.Request) (store.Project, error) {
 			return p, err
 		}
 	}
+	p.SelfApply = r.PostFormValue("self_apply") != ""
 	return p, nil
 }
 
 func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
+	if !s.siteAdmin(w, r) {
+		return
+	}
 	p, err := projectForm(r)
 	if err == nil {
 		p.ID, err = s.Store.CreateProject(r.Context(), p)
@@ -281,6 +369,8 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, "projects", http.StatusBadRequest, map[string]any{"Projects": ps, "Form": p}, saveError(err))
 		return
 	}
+	s.audit(r.Context(), sess(r).user, p, "project create", "")
+	s.auditSchedule(r, p, store.Project{}, p)
 	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
 }
 
@@ -297,33 +387,54 @@ func id(r *http.Request) int64 {
 }
 
 func (s *Server) project(w http.ResponseWriter, r *http.Request) {
-	p, err := s.Store.Project(r.Context(), id(r))
-	if err != nil {
-		s.fail(w, err)
+	p, role, ok := s.allowed(w, r, id(r), store.RoleViewer)
+	if !ok {
 		return
 	}
-	s.projectPage(w, r, p, p, http.StatusOK, "")
+	s.projectPage(w, r, p, p, role, http.StatusOK, "")
 }
 
-// projectPage renders the project page with form in its settings.
-func (s *Server) projectPage(w http.ResponseWriter, r *http.Request, p, form store.Project, status int, errMsg string) {
+// projectPage renders the project page with form in its settings. Only a
+// project admin gets the settings, credentials and roles.
+func (s *Server) projectPage(w http.ResponseWriter, r *http.Request, p, form store.Project, role string, status int, errMsg string) {
 	runs, err := s.Store.Runs(r.Context(), p.ID)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	creds, err := s.Store.Credentials(r.Context(), p.ID)
-	if err != nil {
-		s.fail(w, err)
-		return
+	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey()}
+	if store.RoleAtLeast(role, store.RoleAdmin) {
+		if d["Credentials"], err = s.Store.Credentials(r.Context(), p.ID); err == nil {
+			if d["Members"], err = s.Store.Members(r.Context(), p.ID); err == nil {
+				d["Users"], err = s.Store.Users(r.Context())
+			}
+		}
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
 	}
-	s.render(w, r, "project", status, map[string]any{"Project": p, "Form": form, "Runs": runs, "Credentials": creds, "HasKey": s.Store.HasKey()}, errMsg)
+	s.render(w, r, "project", status, d, errMsg)
+}
+
+// auditSchedule records a change to a project's drift check schedule or
+// webhook. A webhook may hold a token, so only its host goes in.
+func (s *Server) auditSchedule(r *http.Request, p, old, saved store.Project) {
+	if old.Schedule != saved.Schedule {
+		s.audit(r.Context(), sess(r).user, p, "schedule change", fmt.Sprintf("%q to %q", old.Schedule, saved.Schedule))
+	}
+	if old.WebhookURL != saved.WebhookURL {
+		detail := "removed"
+		if saved.WebhookURL != "" {
+			detail = "set, to " + saved.WebhookHost()
+		}
+		s.audit(r.Context(), sess(r).user, p, "webhook change", detail)
+	}
 }
 
 func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
-	p, err := s.Store.Project(r.Context(), id(r))
-	if err != nil {
-		s.fail(w, err)
+	p, role, ok := s.allowed(w, r, id(r), store.RoleAdmin)
+	if !ok {
 		return
 	}
 	form, err := projectForm(r)
@@ -336,9 +447,15 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 		err = s.Store.UpdateProject(r.Context(), form)
 	}
 	if err != nil {
-		s.projectPage(w, r, p, form, http.StatusBadRequest, saveError(err))
+		s.projectPage(w, r, p, form, role, http.StatusBadRequest, saveError(err))
 		return
 	}
+	detail := ""
+	if form.Name != p.Name {
+		detail = "renamed from " + p.Name
+	}
+	s.audit(r.Context(), sess(r).user, form, "project edit", detail)
+	s.auditSchedule(r, form, p, form)
 	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
 }
 
@@ -346,9 +463,8 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 // value is never shown again, not even when the form comes back with an
 // error.
 func (s *Server) setCredential(w http.ResponseWriter, r *http.Request) {
-	p, err := s.Store.Project(r.Context(), id(r))
-	if err != nil {
-		s.fail(w, err)
+	p, role, ok := s.allowed(w, r, id(r), store.RoleAdmin)
+	if !ok {
 		return
 	}
 	name, kind := strings.TrimSpace(r.PostFormValue("name")), r.PostFormValue("kind")
@@ -358,7 +474,7 @@ func (s *Server) setCredential(w http.ResponseWriter, r *http.Request) {
 	} else if !strings.HasSuffix(value, "\n") {
 		value += "\n" // a pasted key loses its last newline, and ssh won't read a key without one
 	}
-	err = run.ValidateCredentialName(name)
+	err := run.ValidateCredentialName(name)
 	switch {
 	case err != nil:
 	case kind != store.CredFile && kind != store.CredEnv:
@@ -369,24 +485,59 @@ func (s *Server) setCredential(w http.ResponseWriter, r *http.Request) {
 		err = s.Store.SetCredential(r.Context(), p.ID, name, kind, []byte(value))
 	}
 	if err != nil {
-		s.projectPage(w, r, p, p, http.StatusBadRequest, err.Error())
+		s.projectPage(w, r, p, p, role, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.audit(r.Context(), sess(r).user, p, "credential set", name+", as "+kind)
 	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
 }
 
 func (s *Server) deleteCredential(w http.ResponseWriter, r *http.Request) {
-	if err := s.Store.DeleteCredential(r.Context(), id(r), r.PathValue("name")); err != nil {
+	p, _, ok := s.allowed(w, r, id(r), store.RoleAdmin)
+	if !ok {
+		return
+	}
+	if err := s.Store.DeleteCredential(r.Context(), p.ID, r.PathValue("name")); err != nil {
 		s.fail(w, err)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/projects/%d", id(r)), http.StatusSeeOther)
+	s.audit(r.Context(), sess(r).user, p, "credential delete", r.PathValue("name"))
+	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
+}
+
+// setRole gives a user a role on the project, or takes it away when the
+// role is blank.
+func (s *Server) setRole(w http.ResponseWriter, r *http.Request) {
+	p, role, ok := s.allowed(w, r, id(r), store.RoleAdmin)
+	if !ok {
+		return
+	}
+	userID, _ := strconv.ParseInt(r.PostFormValue("user"), 10, 64)
+	u, err := s.Store.User(r.Context(), userID)
+	if err != nil {
+		s.projectPage(w, r, p, p, role, http.StatusBadRequest, "Pick a user.")
+		return
+	}
+	newRole := r.PostFormValue("role")
+	if err := s.Store.SetRole(r.Context(), p.ID, u.ID, newRole); err != nil {
+		s.projectPage(w, r, p, p, role, http.StatusBadRequest, err.Error())
+		return
+	}
+	if newRole == "" {
+		newRole = "no role"
+	}
+	s.audit(r.Context(), sess(r).user, p, "role change", u.Name+": "+newRole)
+	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
 }
 
 func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.Store.Runs(r.Context(), id(r))
+	p, _, ok := s.allowed(w, r, id(r), store.RoleAdmin)
+	if !ok {
+		return
+	}
+	runs, err := s.Store.Runs(r.Context(), p.ID)
 	if err == nil {
-		err = s.Store.DeleteProject(r.Context(), id(r))
+		err = s.Store.DeleteProject(r.Context(), p.ID)
 	}
 	if err != nil {
 		s.fail(w, err)
@@ -395,13 +546,13 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	for _, rn := range runs {
 		os.RemoveAll(path.Dir(s.Runner.PlanFile(rn.ID)))
 	}
+	s.audit(r.Context(), sess(r).user, p, "project delete", "")
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) startPlan(w http.ResponseWriter, r *http.Request) {
-	p, err := s.Store.Project(r.Context(), id(r))
-	if err != nil {
-		s.fail(w, err)
+	p, _, ok := s.allowed(w, r, id(r), store.RolePlanner)
+	if !ok {
 		return
 	}
 	runID, err := s.Runner.StartPlan(r.Context(), p, sess(r).user.ID)
@@ -409,41 +560,77 @@ func (s *Server) startPlan(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r.Context(), sess(r).user, p, "plan", fmt.Sprintf("run %d", runID))
 	http.Redirect(w, r, fmt.Sprintf("/runs/%d", runID), http.StatusSeeOther)
 }
 
-// mayApply says whether u may approve and apply plan.
-// shortcut: the one admin may apply any plan; #892 brings the approver
-// role, and the setting that lets a planner apply their own plan belongs
-// there too (TODO in #892, not here).
-func mayApply(u store.User, plan store.Run) bool {
-	return u.ID != 0
+// mayApply says whether u, with role on p, may approve and apply plan. An
+// approver applies a plan someone else made; a planner or approver may
+// apply their own only when p allows it. An admin may apply any plan, so a
+// project with one admin still works.
+func mayApply(u store.User, role string, p store.Project, plan store.Run) bool {
+	switch {
+	case store.RoleAtLeast(role, store.RoleAdmin):
+		return true
+	case plan.CreatedBy.Valid && plan.CreatedBy.Int64 == u.ID:
+		return p.SelfApply && store.RoleAtLeast(role, store.RolePlanner)
+	default:
+		return store.RoleAtLeast(role, store.RoleApprover)
+	}
+}
+
+// cancelRole is the role that may cancel rn: an apply needs one that may
+// apply, anything else one that may plan.
+func cancelRole(rn store.Run) string {
+	if rn.Kind == store.KindApply {
+		return store.RoleApprover
+	}
+	return store.RolePlanner
 }
 
 // runData is the run page and its status partial.
 type runData struct {
 	Run     store.Run
 	Project store.Project
-	Lines   [][]byte
-	Last    int64
-	Result  *run.Result
+	// Role is the user's role on Project.
+	Role   string
+	Lines  [][]byte
+	Last   int64
+	Result *run.Result
 	// CanApply is true when the run is a plan this user may apply now.
 	CanApply bool
+	// CanCancel is true when the run is unfinished and this user may
+	// cancel it.
+	CanCancel bool
 	// HasReport is true when the run is an apply that left a -report file.
 	HasReport bool
 }
 
-func (s *Server) loadRun(r *http.Request) (runData, error) {
+// runAllowed loads a run, its project and the user's role on it, as
+// allowed does, answering 403 and returning false when the role is below
+// a viewer.
+func (s *Server) runAllowed(w http.ResponseWriter, r *http.Request) (store.Run, store.Project, string, bool) {
+	rn, err := s.Store.Run(r.Context(), id(r))
+	if err != nil {
+		s.fail(w, err)
+		return rn, store.Project{}, "", false
+	}
+	p, role, ok := s.allowed(w, r, rn.ProjectID, store.RoleViewer)
+	return rn, p, role, ok
+}
+
+// loadRun loads the run page's data, answering the request itself and
+// returning false when it can't.
+func (s *Server) loadRun(w http.ResponseWriter, r *http.Request) (runData, bool) {
 	var d runData
+	var ok bool
+	if d.Run, d.Project, d.Role, ok = s.runAllowed(w, r); !ok {
+		return d, false
+	}
 	var err error
-	if d.Run, err = s.Store.Run(r.Context(), id(r)); err != nil {
-		return d, err
-	}
-	if d.Project, err = s.Store.Project(r.Context(), d.Run.ProjectID); err != nil {
-		return d, err
-	}
 	if d.Lines, d.Last, err = s.Store.Events(r.Context(), d.Run.ID); err != nil {
-		return d, err
+		s.fail(w, err)
+		return d, false
 	}
 	if d.Run.Finished() {
 		res := run.Group(d.Lines)
@@ -452,18 +639,27 @@ func (s *Server) loadRun(r *http.Request) (runData, error) {
 	if _, err := os.Stat(s.Runner.ReportFile(d.Run.ID)); err == nil {
 		d.HasReport = true
 	}
-	if d.Run.Kind == store.KindPlan && d.Run.Status == store.StatusSucceeded && d.Result.HasChanges() && mayApply(sess(r).user, d.Run) {
+	d.CanCancel = !d.Run.Finished() && store.RoleAtLeast(d.Role, cancelRole(d.Run))
+	if d.Run.Kind == store.KindPlan && d.Run.Status == store.StatusSucceeded && d.Result.HasChanges() && mayApply(sess(r).user, d.Role, d.Project, d.Run) {
 		if d.CanApply, err = s.Store.Applicable(r.Context(), d.Run.ID); err != nil {
-			return d, err
+			s.fail(w, err)
+			return d, false
 		}
 	}
-	return d, nil
+	return d, true
 }
 
 func (s *Server) startApply(w http.ResponseWriter, r *http.Request) {
-	d, err := s.loadRun(r)
-	if err != nil {
-		s.fail(w, err)
+	d, ok := s.loadRun(w, r)
+	if !ok {
+		return
+	}
+	if !mayApply(sess(r).user, d.Role, d.Project, d.Run) {
+		why := fmt.Sprintf("Applying a plan someone else made needs the approver role on %s.", d.Project.Name)
+		if d.Run.CreatedBy.Int64 == sess(r).user.ID {
+			why = fmt.Sprintf("Someone else has to approve your plan: an approver on %s, or an admin. A project admin can let planners apply their own plans.", d.Project.Name)
+		}
+		s.forbid(w, r, why)
 		return
 	}
 	if !d.CanApply {
@@ -479,15 +675,21 @@ func (s *Server) startApply(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r.Context(), sess(r).user, d.Project, "apply", fmt.Sprintf("run %d, of plan %d", runID, d.Run.ID))
 	http.Redirect(w, r, fmt.Sprintf("/runs/%d", runID), http.StatusSeeOther)
 }
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
-	rn, err := s.Store.Run(r.Context(), id(r))
-	if err == nil {
-		err = s.Runner.Cancel(rn.ID)
+	rn, p, role, ok := s.runAllowed(w, r)
+	if !ok {
+		return
 	}
-	if errors.Is(err, store.ErrNotFound) && rn.ID != 0 {
+	if !store.RoleAtLeast(role, cancelRole(rn)) {
+		s.forbid(w, r, fmt.Sprintf("Cancelling this %s needs the %s role on %s.", rn.Kind, cancelRole(rn), p.Name))
+		return
+	}
+	err := s.Runner.Cancel(rn.ID)
+	if errors.Is(err, store.ErrNotFound) {
 		http.Error(w, "this run isn't running", http.StatusConflict)
 		return
 	}
@@ -495,13 +697,13 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r.Context(), sess(r).user, p, "cancel", fmt.Sprintf("run %d", rn.ID))
 	http.Redirect(w, r, fmt.Sprintf("/runs/%d", rn.ID), http.StatusSeeOther)
 }
 
 func (s *Server) runPage(w http.ResponseWriter, r *http.Request) {
-	d, err := s.loadRun(r)
-	if err != nil {
-		s.fail(w, err)
+	d, ok := s.loadRun(w, r)
+	if !ok {
 		return
 	}
 	s.render(w, r, "run", http.StatusOK, d, "")
@@ -509,9 +711,8 @@ func (s *Server) runPage(w http.ResponseWriter, r *http.Request) {
 
 // runReport serves an apply's -report file.
 func (s *Server) runReport(w http.ResponseWriter, r *http.Request) {
-	rn, err := s.Store.Run(r.Context(), id(r))
-	if err != nil {
-		s.fail(w, err)
+	rn, _, _, ok := s.runAllowed(w, r)
+	if !ok {
 		return
 	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="run-%d-report.json"`, rn.ID))
@@ -527,6 +728,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.Filter{Host: strings.TrimSpace(q.Get("host")), Status: q.Get("status")}
 	f.ProjectID, _ = strconv.ParseInt(q.Get("project"), 10, 64)
+	if u := sess(r).user; !u.Admin {
+		f.UserID = u.ID
+	}
 	pg, _ := strconv.Atoi(q.Get("page"))
 	pg = max(pg, 1)
 	runs, err := s.Store.History(r.Context(), f, historyPage+1, (pg-1)*historyPage)
@@ -534,7 +738,7 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	ps, err := s.Store.Projects(r.Context())
+	ps, err := s.visibleProjects(r)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -566,9 +770,8 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runStatus(w http.ResponseWriter, r *http.Request) {
-	d, err := s.loadRun(r)
-	if err != nil {
-		s.fail(w, err)
+	d, ok := s.loadRun(w, r)
+	if !ok {
 		return
 	}
 	s.execute(w, r, "run", "status", http.StatusOK, d, "")
@@ -577,9 +780,8 @@ func (s *Server) runStatus(w http.ResponseWriter, r *http.Request) {
 // runEvents streams a run's lines as server-sent events, from the line
 // after Last-Event-ID or ?after, and ends with a done event.
 func (s *Server) runEvents(w http.ResponseWriter, r *http.Request) {
-	rn, err := s.Store.Run(r.Context(), id(r))
-	if err != nil {
-		s.fail(w, err)
+	rn, _, _, ok := s.runAllowed(w, r)
+	if !ok {
 		return
 	}
 	after, _ := strconv.ParseInt(r.Header.Get("Last-Event-ID"), 10, 64)

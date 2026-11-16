@@ -89,10 +89,14 @@ func serve(listen, data, keyFile string) error {
 	if n, err := st.UserCount(ctx); err != nil {
 		return err
 	} else if n == 0 {
-		// shortcut: one admin with a printed password until #892 brings
-		// OIDC sign-in and roles.
+		// The first admin's password is printed once; they make everyone
+		// else's under Users.
 		password := store.Token(12)
-		if _, err := st.CreateUser(ctx, "admin", password); err != nil {
+		id, err := st.CreateUser(ctx, "admin", password)
+		if err == nil {
+			err = st.SetUser(ctx, id, true, false)
+		}
+		if err != nil {
 			return err
 		}
 		log.Printf("created the admin account. Sign in as admin with the password %s", password)

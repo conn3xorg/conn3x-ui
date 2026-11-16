@@ -10,10 +10,13 @@
     <tr><td><a href="/projects/{{.ID}}">{{.Name}}</a></td><td>{{.GitURL}}</td><td>{{.GitRef}}</td></tr>
     {{end}}
   </table>
-  {{else}}
+  {{else if .User.Admin}}
   <p>No projects yet. A project is a Git repository with circuits in it. Add one and press Plan to see what Conn3x would change.</p>
+  {{else}}
+  <p>You don't have a role on any project yet. A project admin can give you one.</p>
   {{end}}
 </section>
+{{if .User.Admin}}
 <section>
   <h2>New project</h2>
   <form method="post" action="/projects">
@@ -21,5 +24,6 @@
     <p><button class="primary">Create project</button></p>
   </form>
 </section>
+{{end}}
 </div>
 {{end}}

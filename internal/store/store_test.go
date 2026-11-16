@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -357,24 +358,219 @@ func TestDriftChecks(t *testing.T) {
 // TestMigrateKeepsProjects opens a database from before schedules and
 // finds its projects with none.
 func TestMigrateKeepsProjects(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ui.db")
+	path := openAt(t, 4, "INSERT INTO projects (name, git_url, git_ref, path, conn3x_path, env, created_at, updated_at) VALUES ('old', 'u', 'main', '.', 'conn3x', '', 't', 't')")
 	s, err := Open(path)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("ALTER TABLE projects DROP COLUMN schedule; ALTER TABLE projects DROP COLUMN webhook_url; ALTER TABLE runs DROP COLUMN outcome; PRAGMA user_version = 4"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("INSERT INTO projects (name, git_url, git_ref, path, conn3x_path, env, created_at, updated_at) VALUES ('old', 'u', 'main', '.', 'conn3x', '', 't', 't')"); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	if s, err = Open(path); err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	ps, err := s.Projects(context.Background())
 	if err != nil || len(ps) != 1 || ps[0].Name != "old" || ps[0].Schedule != "" || ps[0].WebhookURL != "" {
 		t.Errorf("%+v %v", ps, err)
+	}
+}
+
+// openAt makes a database with only the first version migrations, runs
+// query in it, and returns its path for Open to bring up to date.
+func openAt(t *testing.T, version int, query string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ui.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, m := range migrations[:version] {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d; %s", version, query)); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestUsers(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	id, err := s.CreateUser(ctx, "alice", "first-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, err := s.User(ctx, id); err != nil || u.Name != "alice" || u.Admin || u.Disabled {
+		t.Fatalf("new user %+v %v", u, err)
+	}
+	if err := s.SetUser(ctx, id, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := s.UserNamed(ctx, "alice"); !u.Admin {
+		t.Errorf("not made admin: %+v", u)
+	}
+	if _, err := s.UserNamed(ctx, "nobody"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing user: %v", err)
+	}
+
+	// A new password works, the old one doesn't, and only the kept session
+	// survives.
+	keep, _, _ := s.Login(ctx, "alice", "first-password", time.Hour)
+	other, _, _ := s.Login(ctx, "alice", "first-password", time.Hour)
+	if err := s.SetPassword(ctx, id, "second-password", keep); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckPassword(ctx, id, "first-password"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("old password: %v", err)
+	}
+	if err := s.CheckPassword(ctx, id, "second-password"); err != nil {
+		t.Errorf("new password: %v", err)
+	}
+	if _, _, err := s.Session(ctx, other); !errors.Is(err, ErrNotFound) {
+		t.Error("another session outlived the password change")
+	}
+	if _, _, err := s.Session(ctx, keep); err != nil {
+		t.Errorf("kept session: %v", err)
+	}
+
+	// Disabled, the user's sessions end and they can't sign in.
+	if err := s.SetUser(ctx, id, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Session(ctx, keep); !errors.Is(err, ErrNotFound) {
+		t.Error("session outlived disabling")
+	}
+	if _, _, err := s.Login(ctx, "alice", "second-password", time.Hour); !errors.Is(err, ErrNotFound) {
+		t.Errorf("disabled user signed in: %v", err)
+	}
+	if err := s.SetUser(ctx, 999, false, false); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing user: %v", err)
+	}
+	if us, err := s.Users(ctx); err != nil || len(us) != 1 || !us[0].Disabled {
+		t.Errorf("%+v %v", us, err)
+	}
+}
+
+func TestRoles(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	web, _ := s.CreateProject(ctx, Project{Name: "web"})
+	db, _ := s.CreateProject(ctx, Project{Name: "db"})
+	alice, _ := s.CreateUser(ctx, "alice", "pw")
+	bob, _ := s.CreateUser(ctx, "bob", "pw")
+	if role, err := s.Role(ctx, web, alice); err != nil || role != "" {
+		t.Errorf("no role: %q %v", role, err)
+	}
+	if err := s.SetRole(ctx, web, alice, RolePlanner); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRole(ctx, web, alice, RoleApprover); err != nil {
+		t.Fatal(err)
+	}
+	s.SetRole(ctx, web, bob, RoleViewer)
+	if err := s.SetRole(ctx, db, bob, "owner"); err == nil {
+		t.Error("unknown role accepted")
+	}
+	if role, _ := s.Role(ctx, web, alice); role != RoleApprover {
+		t.Errorf("role %q", role)
+	}
+	if ms, err := s.Members(ctx, web); err != nil || len(ms) != 2 || ms[0].Name != "alice" || ms[1].Role != RoleViewer {
+		t.Errorf("%+v %v", ms, err)
+	}
+	if ps, err := s.MemberProjects(ctx, bob); err != nil || len(ps) != 1 || ps[0].ID != web {
+		t.Errorf("%+v %v", ps, err)
+	}
+
+	// History keeps to the projects a user has a role on.
+	r1, _ := s.CreateRun(ctx, web, KindPlan, alice)
+	s.CreateRun(ctx, db, KindPlan, alice)
+	if runs, _ := s.History(ctx, Filter{UserID: bob}, 10, 0); len(runs) != 1 || runs[0].ID != r1 {
+		t.Errorf("bob's history %+v", runs)
+	}
+	s.SetRole(ctx, web, bob, "")
+	if role, _ := s.Role(ctx, web, bob); role != "" {
+		t.Errorf("role outlived its removal: %q", role)
+	}
+
+	for _, c := range []struct {
+		have, want string
+		ok         bool
+	}{
+		{RoleAdmin, RoleViewer, true}, {RoleApprover, RoleApprover, true}, {RolePlanner, RoleApprover, false},
+		{RoleViewer, RolePlanner, false}, {"", RoleViewer, false}, {"owner", RoleViewer, false},
+	} {
+		if RoleAtLeast(c.have, c.want) != c.ok {
+			t.Errorf("RoleAtLeast(%q, %q) = %v", c.have, c.want, !c.ok)
+		}
+	}
+}
+
+func TestAudit(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	alice, _ := s.CreateUser(ctx, "alice", "pw")
+	web, _ := s.CreateProject(ctx, Project{Name: "web"})
+	for _, e := range []Entry{
+		{UserID: alice, UserName: "alice", Action: "sign-in"},
+		{UserID: alice, UserName: "alice", ProjectID: web, ProjectName: "web", Action: "plan", Detail: "run 1"},
+		{Action: "sign-in failed", Detail: "unknown name"},
+	} {
+		if err := s.Audit(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := func(f AuditFilter, limit, offset int) []string {
+		es, err := s.AuditLog(ctx, f, limit, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, e := range es {
+			out = append(out, e.Action)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		f             AuditFilter
+		limit, offset int
+		want          string
+	}{
+		{AuditFilter{}, 10, 0, "sign-in failed,plan,sign-in"},
+		{AuditFilter{}, 1, 1, "plan"},
+		{AuditFilter{UserID: alice}, 10, 0, "plan,sign-in"},
+		{AuditFilter{ProjectID: web}, 10, 0, "plan"},
+	} {
+		if g := strings.Join(got(c.f, c.limit, c.offset), ","); g != c.want {
+			t.Errorf("%+v: %s, want %s", c, g, c.want)
+		}
+	}
+
+	// Deleting the project keeps its entries, and nothing edits or removes
+	// one.
+	s.DeleteProject(ctx, web)
+	if es, _ := s.AuditLog(ctx, AuditFilter{ProjectID: web}, 10, 0); len(es) != 1 || es[0].ProjectName != "web" || es[0].UserName != "alice" || es[0].At == "" {
+		t.Errorf("after delete %+v", es)
+	}
+	if _, err := s.db.Exec("UPDATE audit SET detail = 'x'"); err == nil || !strings.Contains(err.Error(), "append-only") {
+		t.Errorf("update: %v", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM audit"); err == nil {
+		t.Error("delete allowed")
+	}
+}
+
+// TestMigrateKeepsAdmin opens a database from before roles and finds its
+// one user still an admin.
+func TestMigrateKeepsAdmin(t *testing.T) {
+	path := openAt(t, 5, "INSERT INTO users (name, password_hash, created_at) VALUES ('admin', 'x', 't')")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if u, err := s.UserNamed(context.Background(), "admin"); err != nil || !u.Admin || u.Disabled {
+		t.Errorf("%+v %v", u, err)
+	}
+	id, _ := s.CreateUser(context.Background(), "new", "pw")
+	if u, _ := s.User(context.Background(), id); u.Admin {
+		t.Error("a new user is an admin")
 	}
 }

@@ -53,7 +53,7 @@ go build -o conn3x-ui .
 ./conn3x-ui serve -listen 127.0.0.1:8080 -data ./data
 ```
 
-The first start creates an `admin` account and prints its password to the log, once. Sign in at <http://127.0.0.1:8080>, add a project, press Plan.
+The first start creates an `admin` account and prints its password to the log, once. Sign in at <http://127.0.0.1:8080>, add a project, press Plan. Then make everyone else an account under [Users](#users-and-roles).
 
 `-data` is where the SQLite database and each run's saved plan live. Back it up like any other file.
 
@@ -102,7 +102,7 @@ One run at a time per project; a second one waits its turn.
 
 ## What an apply does
 
-A finished plan with changes gets an Apply button, as long as it's the project's newest plan and hasn't been applied. Pressing it records who approved and when, then:
+A finished plan with changes gets an Apply button, as long as it's the project's newest plan, it hasn't been applied, and your [role](#users-and-roles) lets you apply it. Pressing it records who approved and when, then:
 
 1. Clones the ref and moves to the commit the plan was made from, even if the branch has moved on since.
 2. `conn3x init -input=false`, then `conn3x apply -input=false -report=report.json plan.bin` with the saved plan file. The stream goes through `-json-into`, since `-report` doesn't go with `-json`.
@@ -148,17 +148,48 @@ Add a **drift webhook** to hear about it. When a check finds drift, or fails, th
 
 The URL must be `http://` or `https://`. Webhook URLs often carry a token, so once saved the page shows only the host, and the log never prints it. Leave the field blank to keep the saved one, or tick **Remove the webhook**.
 
+## Users and roles
+
+Everyone signs in with their own account. A site admin makes them under **Users**: a name, and a password you type or leave blank for a generated one, shown once. Pass it on, and they can change it under their name at the top. From the same page a site admin resets a password or disables an account. Either one signs that person out everywhere, and a disabled account can't sign in. Nobody can disable themselves or drop their own admin, so the last admin can't lock everyone out.
+
+Nobody sees a project until they have a role on it. A project admin gives roles under **Roles** on the project's page. Each role can do what the one above it can, and more:
+
+| Role | Can |
+| --- | --- |
+| viewer | See the project, its runs, their output and reports, and the history |
+| planner | Start a plan, and cancel a plan or drift check |
+| approver | Apply a plan someone else made, and cancel an apply |
+| admin | Edit and delete the project, its credentials, its drift schedule and its roles, and apply any plan, their own included |
+
+A **site admin** is admin on every project, creates projects, manages users and reads the audit log.
+
+Four eyes on every apply, then: a plan made by a planner needs an approver or an admin to apply it, and an approver can't apply their own. Tick **Planners may apply their own plans** in a project's settings and planners and approvers can. An admin may always apply their own, so a lab with one admin still works.
+
+The server checks the role on every page and button, not just the browser. A button you can't use isn't shown, and posting it anyway gets a 403 that says which role you'd need.
+
+## Audit log
+
+Who did what, and when. **Audit**, for site admins, lists it newest first, 50 to a page, filtered by user and project. It records:
+
+- sign-in, sign-out, and failed sign-ins, with why: a wrong password, a disabled account, or a name nobody has. That last one doesn't keep the name, in case it was a password typed in the wrong box.
+- users created, passwords reset or changed, site admin and disabled changes, and roles given or taken away.
+- projects created, edited and deleted; drift schedule changes, and webhook changes by host only.
+- credentials set or deleted, by name.
+- plans, applies and cancels, with the run.
+
+No password or credential value is ever in it. An entry keeps the user's and project's names as they were, so it still reads right after either is gone. The table is append-only: the database refuses to change or delete an entry.
+
 ## Not here yet
 
 The rest of the design, in the order it's planned:
 
-- OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Until then the one admin may apply any plan; the approver role and the "planners may apply their own plan" setting come with the roles.
+- OIDC sign-in (Keycloak, Entra ID, Google, GitHub), roles for groups, and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, roles per person and the audit log are in.
 - Drift notifications by email, and a Check drift button: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - apt, dnf, Homebrew and Scoop packages, and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries and the image are in.
 
 Credentials are in, with the key from a file or a variable; a KMS for the key comes later, also under [#891](https://github.com/conn3xorg/conn3x/issues/891).
 
-Until then, treat it as a lab tool: one admin, runs on the UI's own host.
+Until then, treat it as a lab tool: local accounts, runs on the UI's own host.
 
 ## Developing
 

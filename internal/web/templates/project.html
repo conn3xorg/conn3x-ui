@@ -1,11 +1,14 @@
 {{define "title"}}{{.Data.Project.Name}}{{end}}
 {{define "content"}}
 <h1>{{.Data.Project.Name}}</h1>
+<p><small>Your role here: {{.Data.Role}}</small></p>
+{{if atLeast .Data.Role "planner"}}
 <form method="post" action="/projects/{{.Data.Project.ID}}/plan" style="display:inline">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <button class="primary">Plan</button>
   <small>Fetches {{.Data.Project.GitRef}} and shows what would change. Nothing is applied.</small>
 </form>
+{{end}}
 <div class="cols">
 <section>
   <h2>Runs</h2>
@@ -19,6 +22,7 @@
   </table>
   {{else}}<p>No runs yet.</p>{{end}}
 </section>
+{{if atLeast .Data.Role "admin"}}
 <section>
   <h2>Settings</h2>
   <form method="post" action="/projects/{{.Data.Project.ID}}">
@@ -51,10 +55,27 @@
   {{else}}
   <p><small>Credentials need a key. Make one with <code>openssl rand -base64 32 &gt; key</code>, then start conn3x-ui with <code>-key-file key</code>, or with the value in <code>CONN3X_UI_KEY</code>.</small></p>
   {{end}}
+  <h2>Roles</h2>
+  {{if .Data.Members}}
+  <table>
+    <tr><th>User</th><th>Role</th></tr>
+    {{range .Data.Members}}<tr><td>{{.Name}}</td><td>{{.Role}}</td></tr>{{end}}
+  </table>
+  {{else}}<p>Nobody has a role here yet. Site admins are admin on every project.</p>{{end}}
+  <form method="post" action="/projects/{{.Data.Project.ID}}/roles">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="role_user">User</label>
+    <select id="role_user" name="user">{{range .Data.Users}}{{if not .Disabled}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}</select>
+    <label for="role">Role</label>
+    <select id="role" name="role">{{range roles}}<option>{{.}}</option>{{end}}<option value="">no role</option></select>
+    <small>A viewer sees runs and history. A planner also starts plans. An approver also applies a plan someone else made. An admin also edits the project, its credentials and its roles.</small>
+    <p><button class="primary">Set role</button></p>
+  </form>
   <form method="post" action="/projects/{{.Data.Project.ID}}/delete" onsubmit="return confirm('Delete {{.Data.Project.Name}} and its run history?')">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <button class="danger">Delete project</button>
   </form>
 </section>
+{{end}}
 </div>
 {{end}}
