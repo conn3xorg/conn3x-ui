@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -138,6 +139,55 @@ func TestApplyRuns(t *testing.T) {
 		t.Errorf("%+v", r)
 	}
 	if runs, _ := s.Runs(ctx, pid); len(runs) != 4 || runs[0].Kind != KindPlan || runs[2].Kind != KindApply {
+		t.Errorf("%+v", runs)
+	}
+}
+
+func TestHistory(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	web, _ := s.CreateProject(ctx, Project{Name: "web"})
+	db, _ := s.CreateProject(ctx, Project{Name: "db"})
+	uid, _ := s.CreateUser(ctx, "admin", "pw")
+	r1, _ := s.CreateRun(ctx, web, KindPlan, uid)
+	r2, _ := s.CreateRun(ctx, db, KindPlan, uid)
+	r3, _ := s.CreateRun(ctx, web, KindPlan, uid)
+	s.FinishRun(ctx, r1, StatusSucceeded, "")
+	s.FinishRun(ctx, r2, StatusFailed, "boom")
+	s.SetRunHosts(ctx, r1, map[string]string{"web1": "changes", "web2": "changes"})
+	s.SetRunHosts(ctx, r3, map[string]string{"web1": "failed"})
+	s.SetRunHosts(ctx, r3, map[string]string{"web1": "ok"}) // replaces
+	ids := func(f Filter, limit, offset int) []int64 {
+		t.Helper()
+		runs, err := s.History(ctx, f, limit, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []int64
+		for _, r := range runs {
+			out = append(out, r.ID)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		f             Filter
+		limit, offset int
+		want          []int64
+	}{
+		{Filter{}, 10, 0, []int64{r3, r2, r1}},
+		{Filter{}, 2, 1, []int64{r2, r1}},
+		{Filter{ProjectID: web}, 10, 0, []int64{r3, r1}},
+		{Filter{Status: StatusFailed}, 10, 0, []int64{r2}},
+		{Filter{Host: "web1"}, 10, 0, []int64{r3, r1}},
+		{Filter{Host: "web2", ProjectID: web, Status: StatusSucceeded}, 10, 0, []int64{r1}},
+		{Filter{Host: "web3"}, 10, 0, nil},
+	} {
+		if got := ids(c.f, c.limit, c.offset); fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("%+v %d %d: %v, want %v", c.f, c.limit, c.offset, got, c.want)
+		}
+	}
+	runs, _ := s.History(ctx, Filter{Host: "web1"}, 10, 0)
+	if runs[0].HostOutcome != "ok" || runs[1].HostOutcome != "changes" || runs[0].ProjectName != "web" || runs[0].CreatedByName.String != "admin" {
 		t.Errorf("%+v", runs)
 	}
 }

@@ -29,7 +29,7 @@
 </head>
 <body>
 <header>
-  <a href="/">Conn3x</a>
+  <span><a href="/">Conn3x</a>{{if .User.Name}} &nbsp; <a href="/runs">Runs</a>{{end}}</span>
   {{if .User.Name}}<span><small>{{.User.Name}}</small>
     <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Sign out</button></form></span>{{end}}
 </header>

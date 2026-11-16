@@ -54,6 +54,35 @@ func (r Result) HasChanges() bool {
 	return s != nil && s.Add+s.Change+s.Remove+s.Import+s.Forget > 0
 }
 
+// Outcome is how the run came out on the host: "failed" when a step
+// failed there, "ok" when its applied steps all succeeded, and "changes"
+// for a plan that would change it.
+func (h Host) Outcome() string {
+	out := "changes"
+	for _, s := range h.Steps {
+		for _, a := range s.Actions {
+			switch a.Outcome {
+			case "failed":
+				return "failed"
+			case "ok":
+				out = "ok"
+			}
+		}
+	}
+	return out
+}
+
+// HostOutcomes is each named host's Outcome, for the run history.
+func (r Result) HostOutcomes() map[string]string {
+	out := map[string]string{}
+	for _, h := range r.Hosts {
+		if h.Name != "" {
+			out[h.Name] = h.Outcome()
+		}
+	}
+	return out
+}
+
 // Group arranges raw stream lines into a Result. Lines it doesn't know are
 // ignored, so an older or newer Conn3x still gives a page.
 func Group(lines [][]byte) Result {
