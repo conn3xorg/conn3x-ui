@@ -94,3 +94,17 @@ func TestValidateGitURL(t *testing.T) {
 		}
 	}
 }
+
+func TestHostOutcomes(t *testing.T) {
+	hook := func(typ, host, step string) []byte {
+		return []byte(fmt.Sprintf(`{"type":%q,"hook":{"resource":{"addr":"a.%s","conn3x":{"circuit":"box","step":%q,"host":%q}},"action":"create"}}`, typ, step, step, host))
+	}
+	plan := Group([][]byte{change("web1", "box", "build", "", "create"), change("", "", "", "", "create")}).HostOutcomes()
+	if len(plan) != 1 || plan["web1"] != "changes" {
+		t.Errorf("plan %v", plan)
+	}
+	apply := Group([][]byte{hook("apply_complete", "web1", "a"), hook("apply_errored", "web1", "b"), hook("apply_complete", "web2", "a")}).HostOutcomes()
+	if len(apply) != 2 || apply["web1"] != "failed" || apply["web2"] != "ok" {
+		t.Errorf("apply %v", apply)
+	}
+}

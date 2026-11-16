@@ -17,8 +17,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -49,7 +51,8 @@ func waitForInterrupt(ch chan os.Signal) {
 // reaches it through the project's environment, picks what it does:
 // "plan" configures an http backend and plans and applies, "local" leaves
 // state local, "stale" refuses the apply the way a stale plan is refused,
-// "hang" makes the plan wait for an interrupt.
+// "hang" makes the plan wait for an interrupt. An apply writes its stream
+// to -json-into and a report to -report, as a real one does.
 func TestMain(m *testing.M) {
 	mode := os.Getenv("CONN3X_FAKE")
 	if mode == "" {
@@ -57,7 +60,20 @@ func TestMain(m *testing.M) {
 	}
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt) // before the version line, so a test that sees it can cancel
-	fmt.Println(versionLine)
+	out, report := os.Stdout, ""
+	for _, a := range os.Args {
+		if path, ok := strings.CutPrefix(a, "-json-into="); ok {
+			out, _ = os.Create(path)
+		}
+		if path, ok := strings.CutPrefix(a, "-report="); ok {
+			report = path
+		}
+		if a == "-json" && report != "" {
+			fmt.Fprintln(os.Stderr, "Error: -report doesn't go with -json")
+			os.Exit(1)
+		}
+	}
+	fmt.Fprintln(out, versionLine)
 	switch os.Args[1] {
 	case "init":
 		if mode != "local" {
@@ -79,21 +95,24 @@ func TestMain(m *testing.M) {
 		}
 	case "apply":
 		if b, err := os.ReadFile(os.Args[len(os.Args)-1]); err != nil || string(b) != "plan" {
-			fmt.Printf(`{"@level":"error","@message":"Error: no plan file","type":"diagnostic","diagnostic":{"severity":"error","summary":"no plan file","detail":%q}}`+"\n", fmt.Sprint(os.Args, err))
+			fmt.Fprintf(out, `{"@level":"error","@message":"Error: no plan file","type":"diagnostic","diagnostic":{"severity":"error","summary":"no plan file","detail":%q}}`+"\n", fmt.Sprint(os.Args, err))
 			os.Exit(1)
 		}
 		if mode == "stale" {
-			fmt.Println(`{"@level":"error","@message":"Error: Saved plan is stale","type":"diagnostic","diagnostic":{"severity":"error","summary":"Saved plan is stale","detail":"The given plan file can no longer be applied because the state was changed by another operation after the plan was created."}}`)
+			fmt.Fprintln(out, `{"@level":"error","@message":"Error: Saved plan is stale","type":"diagnostic","diagnostic":{"severity":"error","summary":"Saved plan is stale","detail":"The given plan file can no longer be applied because the state was changed by another operation after the plan was created."}}`)
 			os.Exit(1)
 		}
 		// The checkout's marker says which commit the apply really ran on.
 		marker, _ := os.ReadFile("marker.txt")
-		fmt.Printf(`{"@level":"info","@message":"marker %s","type":"conn3x_fake"}`+"\n", strings.TrimSpace(string(marker)))
-		fmt.Println(hookLine("apply_start", "web2", "build", "create", 0))
-		fmt.Println(hookLine("apply_complete", "web2", "build", "create", 1.5))
-		fmt.Println(hookLine("apply_complete", "web1", "build", "update", 0.5))
-		fmt.Println(hookLine("apply_errored", "web1", "deploy", "create", 2))
-		fmt.Println(`{"type":"change_summary","@message":"Apply complete! Resources: 1 added, 1 changed, 0 destroyed.","changes":{"add":1,"change":1,"remove":0,"operation":"apply"}}`)
+		fmt.Fprintf(out, `{"@level":"info","@message":"marker %s","type":"conn3x_fake"}`+"\n", strings.TrimSpace(string(marker)))
+		fmt.Fprintln(out, hookLine("apply_start", "web2", "build", "create", 0))
+		fmt.Fprintln(out, hookLine("apply_complete", "web2", "build", "create", 1.5))
+		fmt.Fprintln(out, hookLine("apply_complete", "web1", "build", "update", 0.5))
+		fmt.Fprintln(out, hookLine("apply_errored", "web1", "deploy", "create", 2))
+		fmt.Fprintln(out, `{"type":"change_summary","@message":"Apply complete! Resources: 1 added, 1 changed, 0 destroyed.","changes":{"add":1,"change":1,"remove":0,"operation":"apply"}}`)
+		if report != "" {
+			os.WriteFile(report, []byte(`{"format_version":"1","command":"apply","success":true,"hosts":{"web1":{"steps":[]}}}`), 0o600)
+		}
 	}
 }
 
@@ -372,7 +391,7 @@ func TestApplyFromBrowser(t *testing.T) {
 	sha2 := commit(t, repo, map[string]string{"circuits/marker.txt": "two\n"})
 	applyPath, events := e.apply(t, planPath)
 	joined := strings.Join(events, "\n")
-	for _, want := range []string{"git fetch --depth 1 origin " + sha1, "at commit " + sha1, "marker one", "conn3x apply -input=false plan.bin (plan 1)", "web2 build", "Apply complete"} {
+	for _, want := range []string{"git fetch --depth 1 origin " + sha1, "at commit " + sha1, "marker one", "conn3x apply -input=false -report=report.json plan.bin (plan 1)", "web2 build", "Apply complete"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("apply events lack %q:\n%s", want, joined)
 		}
@@ -382,7 +401,8 @@ func TestApplyFromBrowser(t *testing.T) {
 		t.Errorf("apply run %+v", rn)
 	}
 	_, body := e.get(applyPath)
-	for _, want := range []string{"<h1>Apply 2", `class="status succeeded"`, `<a href="/runs/1">plan 1</a>`, "approved by admin", "<h3>web1</h3>", "<h3>web2</h3>",
+	for _, want := range []string{"<h1>Apply 2", `class="status succeeded"`, "started by admin", `<a href="/runs/1">plan 1</a>`, "approved by admin",
+		`<h3>web1 <span class="failed">failed</span></h3>`, `<h3>web2 <span class="succeeded">ok</span></h3>`, `href="/runs/2/report"`,
 		`<span class="succeeded">ok</span> <small>1.5s</small>`, `<span class="failed">failed</span> <small>2.0s</small>`, "<strong>Apply:</strong> 1 added, 1 changed, 0 destroyed."} {
 		if !strings.Contains(body, want) {
 			t.Errorf("apply page lacks %q", want)
@@ -390,6 +410,14 @@ func TestApplyFromBrowser(t *testing.T) {
 	}
 	if strings.Contains(body, "/apply\"") || strings.Contains(body, "No changes") {
 		t.Errorf("apply page offers Apply or says no changes:\n%s", body)
+	}
+
+	resp, report := e.get(applyPath + "/report")
+	if resp.StatusCode != 200 || !strings.Contains(report, `"format_version":"1"`) || !strings.Contains(resp.Header.Get("Content-Disposition"), "run-2-report.json") {
+		t.Errorf("report: %d %v %s", resp.StatusCode, resp.Header, report)
+	}
+	if resp, _ := e.get(planPath + "/report"); resp.StatusCode != 404 {
+		t.Errorf("a plan's report: %d", resp.StatusCode)
 	}
 
 	// Applied once, the plan can't be applied again.
@@ -417,6 +445,48 @@ func TestApplyFromBrowser(t *testing.T) {
 	}
 	if _, body := e.get(project); !strings.Contains(body, "<td>apply of 1</td>") {
 		t.Errorf("project page lacks the apply:\n%s", body)
+	}
+}
+
+func TestHistory(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, sha := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	e.login(t)
+	web := e.createProject(t, "web", repo, ".", exe, "CONN3X_FAKE=plan")
+	planPath, _ := e.plan(t, web)
+	e.apply(t, planPath)
+	e.plan(t, e.createProject(t, "db", repo, ".", exe, "CONN3X_FAKE=local"))
+
+	_, body := e.get("/")
+	if !strings.Contains(body, `<a href="/runs">Runs</a>`) {
+		t.Error("no Runs link")
+	}
+	_, body = e.get("/runs")
+	for _, want := range []string{`<a href="/runs/3">3</a>`, `<a href="/runs/2">2</a>`, `<a href="/runs/1">1</a>`, ">db</a>", ">web</a>", "apply of 1", "<td>admin</td>", sha[:10], "0.21.0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("history lacks %q:\n%s", want, body)
+		}
+	}
+	if strings.Index(body, `"/runs/3"`) > strings.Index(body, `"/runs/1"`) {
+		t.Error("history isn't newest first")
+	}
+	for query, want := range map[string][]string{
+		"?status=failed":                {"3"},
+		"?project=" + path.Base(web):    {"2", "1"},
+		"?host=web1":                    {"2", "1"},
+		"?host=web1&status=succeeded&x": {"2", "1"},
+		"?host=nowhere":                 nil,
+	} {
+		_, body := e.get("/runs" + query)
+		for _, n := range []string{"1", "2", "3"} {
+			if got := strings.Contains(body, `<a href="/runs/`+n+`">`); got != slices.Contains(want, n) {
+				t.Errorf("%s: run %s listed %v:\n%s", query, n, got, body)
+			}
+		}
+	}
+	if _, body := e.get("/runs?host=web1"); !strings.Contains(body, "<th>On web1</th>") || !strings.Contains(body, "<td>failed</td>") || !strings.Contains(body, "<td>changes</td>") {
+		t.Errorf("host outcomes:\n%s", body)
 	}
 }
 
@@ -548,6 +618,9 @@ func TestRealConn3x(t *testing.T) {
 	}
 	if state == nil {
 		t.Error("the apply wrote no state")
+	}
+	if b, err := os.ReadFile(e.runner.ReportFile(2)); err != nil || !strings.Contains(string(b), "format_version") {
+		t.Errorf("report: %v %s", err, b)
 	}
 	if resp := e.post(runPath+"/apply", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
 		t.Errorf("second apply: %d", resp.StatusCode)

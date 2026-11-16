@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -68,7 +69,7 @@ type page struct {
 // New builds the handler.
 func New(st *store.Store, rn *run.Runner) *Server {
 	s := &Server{Store: st, Runner: rn, Log: log.Default(), pages: map[string]*template.Template{}, mux: http.NewServeMux()}
-	for _, name := range []string{"login", "projects", "project", "run"} {
+	for _, name := range []string{"login", "projects", "project", "run", "runs"} {
 		s.pages[name] = template.Must(template.New("").Funcs(template.FuncMap{"lineText": lineText}).
 			ParseFS(files, "templates/layout.html", "templates/project_form.html", "templates/"+name+".html"))
 	}
@@ -82,7 +83,9 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /projects/{id}", s.updateProject)
 	s.mux.HandleFunc("POST /projects/{id}/delete", s.deleteProject)
 	s.mux.HandleFunc("POST /projects/{id}/plan", s.startPlan)
+	s.mux.HandleFunc("GET /runs", s.history)
 	s.mux.HandleFunc("GET /runs/{id}", s.runPage)
+	s.mux.HandleFunc("GET /runs/{id}/report", s.runReport)
 	s.mux.HandleFunc("POST /runs/{id}/apply", s.startApply)
 	s.mux.HandleFunc("POST /runs/{id}/cancel", s.cancelRun)
 	s.mux.HandleFunc("GET /runs/{id}/status", s.runStatus)
@@ -359,6 +362,8 @@ type runData struct {
 	Result  *run.Result
 	// CanApply is true when the run is a plan this user may apply now.
 	CanApply bool
+	// HasReport is true when the run is an apply that left a -report file.
+	HasReport bool
 }
 
 func (s *Server) loadRun(r *http.Request) (runData, error) {
@@ -376,6 +381,9 @@ func (s *Server) loadRun(r *http.Request) (runData, error) {
 	if d.Run.Finished() {
 		res := run.Group(d.Lines)
 		d.Result = &res
+	}
+	if _, err := os.Stat(s.Runner.ReportFile(d.Run.ID)); err == nil {
+		d.HasReport = true
 	}
 	if d.Run.Kind == store.KindPlan && d.Run.Status == store.StatusSucceeded && d.Result.HasChanges() && mayApply(sess(r).user, d.Run) {
 		if d.CanApply, err = s.Store.Applicable(r.Context(), d.Run.ID); err != nil {
@@ -430,6 +438,64 @@ func (s *Server) runPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, r, "run", http.StatusOK, d, "")
+}
+
+// runReport serves an apply's -report file.
+func (s *Server) runReport(w http.ResponseWriter, r *http.Request) {
+	rn, err := s.Store.Run(r.Context(), id(r))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="run-%d-report.json"`, rn.ID))
+	http.ServeFile(w, r, s.Runner.ReportFile(rn.ID))
+}
+
+// historyPage is how many runs the history shows at a time.
+const historyPage = 50
+
+// history is every run across projects, newest first, filtered by
+// project, host and status.
+func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := store.Filter{Host: strings.TrimSpace(q.Get("host")), Status: q.Get("status")}
+	f.ProjectID, _ = strconv.ParseInt(q.Get("project"), 10, 64)
+	pg, _ := strconv.Atoi(q.Get("page"))
+	pg = max(pg, 1)
+	runs, err := s.Store.History(r.Context(), f, historyPage+1, (pg-1)*historyPage)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	ps, err := s.Store.Projects(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	more := len(runs) > historyPage
+	if more {
+		runs = runs[:historyPage]
+	}
+	// The other pages keep the filters.
+	link := func(n int) string {
+		v := url.Values{}
+		for k, val := range map[string]string{"project": q.Get("project"), "host": f.Host, "status": f.Status} {
+			if val != "" {
+				v.Set(k, val)
+			}
+		}
+		v.Set("page", strconv.Itoa(n))
+		return "/runs?" + v.Encode()
+	}
+	d := map[string]any{"Runs": runs, "Projects": ps, "Filter": f, "Page": pg,
+		"Statuses": []string{store.StatusQueued, store.StatusRunning, store.StatusSucceeded, store.StatusFailed, store.StatusCancelled}}
+	if pg > 1 {
+		d["Prev"] = link(pg - 1)
+	}
+	if more {
+		d["Next"] = link(pg + 1)
+	}
+	s.render(w, r, "runs", http.StatusOK, d, "")
 }
 
 func (s *Server) runStatus(w http.ResponseWriter, r *http.Request) {

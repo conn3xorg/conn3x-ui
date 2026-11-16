@@ -45,20 +45,23 @@ One run at a time per project; a second one waits its turn.
 A finished plan with changes gets an Apply button, as long as it's the project's newest plan and hasn't been applied. Pressing it records who approved and when, then:
 
 1. Clones the ref and moves to the commit the plan was made from, even if the branch has moved on since.
-2. `conn3x init -input=false`, then `conn3x apply -input=false plan.bin` with the saved plan file.
+2. `conn3x init -input=false`, then `conn3x apply -input=false -report=report.json plan.bin` with the saved plan file. The stream goes through `-json-into`, since `-report` doesn't go with `-json`.
 3. Streams the output as the plan did, and shows each host's steps with ok or failed and the seconds each took.
 
 What was approved is what runs. If the state changed since the plan, Conn3x refuses the stale plan and the run fails with its error. A plan applies once; a newer plan in the project retires the older ones.
 
 **Cancel** on a running plan or apply sends Conn3x an interrupt, as Ctrl-C would, so it stops after the current step and releases its state lock. The run ends as `cancelled`.
 
-The apply's `-report` file isn't kept: `conn3x apply -report` doesn't go with `-json`, and the stream carries the same information.
+The report is kept beside the plan, under `DATA/runs/ID/`, and the apply's page has a link to download it.
+
+## History
+
+**Runs** at the top lists every run across projects, newest first: who started it, when, the commit, the Conn3x version and how it ended. Filter by project, host and outcome. Each run's page shows who started and who approved it, and each host's steps with how it came out there.
 
 ## Not here yet
 
 The rest of the design, in the order it's planned:
 
-- History with each run's plan, output and report: [#890](https://github.com/conn3xorg/conn3x/issues/890)
 - Encrypted credentials, SSH keys and `become` passwords: [#891](https://github.com/conn3xorg/conn3x/issues/891)
 - OIDC sign-in, roles and an audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Until then the one admin may apply any plan; the approver role and the "planners may apply their own plan" setting come with the roles.
 - Scheduled drift checks: [#893](https://github.com/conn3xorg/conn3x/issues/893)

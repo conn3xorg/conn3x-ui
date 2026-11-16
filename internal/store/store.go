@@ -74,6 +74,15 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
 	ALTER TABLE runs ADD COLUMN approved_at TEXT;
 	CREATE INDEX runs_plan ON runs(plan_run_id);`,
+	// 3: the hosts each run touched and how each came out, so the history
+	// can be filtered by host.
+	`CREATE TABLE run_hosts (
+		run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+		host TEXT NOT NULL,
+		outcome TEXT NOT NULL,
+		PRIMARY KEY (run_id, host)
+	);
+	CREATE INDEX run_hosts_host ON run_hosts(host, run_id);`,
 }
 
 // Store is the database.
@@ -251,6 +260,8 @@ type Run struct {
 	Conn3xVersion string
 	Error         string
 	CreatedBy     sql.NullInt64
+	CreatedByName sql.NullString
+	ProjectName   string
 	CreatedAt     string
 	StartedAt     sql.NullString
 	FinishedAt    sql.NullString
@@ -259,6 +270,9 @@ type Run struct {
 	ApprovedBy     sql.NullInt64
 	ApprovedByName sql.NullString
 	ApprovedAt     sql.NullString
+	// HostOutcome is how the run came out on the host History was asked
+	// about, and "" from anything else.
+	HostOutcome string
 }
 
 // Finished is true once the run has a final status.
@@ -266,13 +280,15 @@ func (r Run) Finished() bool {
 	return r.Status == StatusSucceeded || r.Status == StatusFailed || r.Status == StatusCancelled
 }
 
-const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, created_at, started_at, finished_at, " +
+const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, " +
+	"(SELECT name FROM users WHERE users.id = runs.created_by), (SELECT name FROM projects WHERE projects.id = runs.project_id), created_at, started_at, finished_at, " +
 	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at"
 
-func scanRun(row interface{ Scan(...any) error }) (Run, error) {
+// scanRun reads runCols, then any extra columns into extra.
+func scanRun(row interface{ Scan(...any) error }, extra ...any) (Run, error) {
 	var r Run
-	err := row.Scan(&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
-		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt)
+	err := row.Scan(append([]any{&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedByName, &r.ProjectName, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
+		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt}, extra...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -363,6 +379,56 @@ func (s *Store) Runs(ctx context.Context, projectID int64) ([]Run, error) {
 		if err != nil {
 			return nil, err
 		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SetRunHosts records each host a run touched and how it came out there,
+// replacing what was recorded before.
+func (s *Store) SetRunHosts(ctx context.Context, id int64, outcomes map[string]string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM run_hosts WHERE run_id=?", id); err != nil {
+		return err
+	}
+	for host, outcome := range outcomes {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO run_hosts (run_id, host, outcome) VALUES (?, ?, ?)", id, host, outcome); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Filter narrows History. A zero field matches every run.
+type Filter struct {
+	ProjectID int64
+	Host      string
+	Status    string
+}
+
+// History returns runs across projects that match f, newest first,
+// skipping the first offset and returning at most limit. With f.Host set,
+// each run's HostOutcome is how it came out on that host.
+func (s *Store) History(ctx context.Context, f Filter, limit, offset int) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT "+runCols+", COALESCE((SELECT outcome FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3), '') FROM runs "+
+		"WHERE (?1 = 0 OR project_id = ?1) AND (?2 = '' OR status = ?2) AND (?3 = '' OR EXISTS (SELECT 1 FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3)) "+
+		"ORDER BY id DESC LIMIT ?4 OFFSET ?5", f.ProjectID, f.Status, f.Host, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		var outcome string
+		r, err := scanRun(rows, &outcome)
+		if err != nil {
+			return nil, err
+		}
+		r.HostOutcome = outcome
 		out = append(out, r)
 	}
 	return out, rows.Err()

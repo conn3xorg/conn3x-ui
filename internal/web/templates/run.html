@@ -19,6 +19,7 @@
 <div id="status" {{if not .Data.Run.Finished}}hx-get="/runs/{{.Data.Run.ID}}/status" hx-trigger="every 2s, refresh" hx-swap="outerHTML"{{end}}>
   <p>
     <span class="status {{.Data.Run.Status}}">{{.Data.Run.Status}}</span>
+    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else}}a removed user{{end}}
     {{if .Data.Run.CommitSHA}} · commit <span class="act">{{printf "%.10s" .Data.Run.CommitSHA}}</span>{{end}}
     {{if .Data.Run.Conn3xVersion}} · Conn3x {{.Data.Run.Conn3xVersion}}{{end}}
     {{if .Data.Run.StartedAt.Valid}} · started {{.Data.Run.StartedAt.String}}{{end}}
@@ -39,13 +40,14 @@
     <small>Applies exactly this plan, at commit {{printf "%.10s" .Data.Run.CommitSHA}}. A plan the state has moved past is refused.</small>
   </form>
   {{end}}
+  {{if .Data.HasReport}}<p><a href="/runs/{{.Data.Run.ID}}/report">Download the report</a> <small>conn3x apply -report: each host's steps and what happened to them.</small></p>{{end}}
   {{if .Data.Run.Error}}<p class="error">{{.Data.Run.Error}}</p>{{end}}
   {{with .Data.Result}}
     {{with .Summary}}<p><strong>{{if eq .Operation "apply"}}Apply:{{else}}Plan:{{end}}</strong> {{.Add}} {{if eq .Operation "apply"}}added{{else}}to add{{end}}, {{.Change}} {{if eq .Operation "apply"}}changed{{else}}to change{{end}}, {{.Remove}} {{if eq .Operation "apply"}}destroyed{{else}}to destroy{{end}}{{if .Import}}, {{.Import}} {{if eq .Operation "apply"}}imported{{else}}to import{{end}}{{end}}.</p>{{end}}
     {{range .Diagnostics}}<p class="error">{{.Severity}}: {{.Summary}}{{if .Detail}}
 {{.Detail}}{{end}}</p>{{end}}
     {{range .Hosts}}
-    <h3>{{if .Name}}{{.Name}}{{else}}Other resources{{end}}</h3>
+    <h3>{{if .Name}}{{.Name}}{{else}}Other resources{{end}}{{if and .Name (eq $.Data.Run.Kind "apply")}} <span class="{{if eq .Outcome "ok"}}succeeded{{else}}failed{{end}}">{{.Outcome}}</span>{{end}}</h3>
     <table>
       {{range .Steps}}{{$step := .Name}}{{range .Actions}}
       <tr><td class="act">{{$step}}{{if .Item}}[{{.Item}}]{{end}}</td><td class="act">{{.Action}}</td>

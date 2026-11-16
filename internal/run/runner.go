@@ -66,6 +66,11 @@ func (r *Runner) PlanFile(runID int64) string {
 	return filepath.Join(r.DataDir, "runs", fmt.Sprint(runID), "plan.bin")
 }
 
+// ReportFile is where an apply run's -report file lives.
+func (r *Runner) ReportFile(runID int64) string {
+	return filepath.Join(r.DataDir, "runs", fmt.Sprint(runID), "report.json")
+}
+
 // StartPlan queues a plan of p and returns the run's ID at once.
 func (r *Runner) StartPlan(ctx context.Context, p store.Project, userID int64) (int64, error) {
 	id, err := r.Store.CreateRun(ctx, p.ID, store.KindPlan, userID)
@@ -142,6 +147,13 @@ func (r *Runner) run(id int64, p store.Project, do func(context.Context) error) 
 	} else if err != nil {
 		status, msg = store.StatusFailed, err.Error()
 		r.note(id, "Error: "+msg)
+	}
+	lines, _, err := r.Store.Events(bg, id)
+	if err == nil {
+		err = r.Store.SetRunHosts(bg, id, Group(lines).HostOutcomes())
+	}
+	if err != nil {
+		r.Log.Printf("run %d: %v", id, err)
 	}
 	if err := r.Store.FinishRun(bg, id, status, msg); err != nil {
 		r.Log.Printf("run %d: %v", id, err)
@@ -253,11 +265,100 @@ func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan st
 	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
 		return fmt.Errorf("init: %w", err)
 	}
-	r.note(id, fmt.Sprintf("conn3x apply -input=false plan.bin (plan %d)", plan.ID))
-	if err := c.Run(ctx, r.record(id), "apply", "-input=false", "plan.bin"); err != nil {
+	if err := os.MkdirAll(filepath.Dir(r.ReportFile(id)), 0o700); err != nil {
+		return err
+	}
+	r.note(id, fmt.Sprintf("conn3x apply -input=false -report=report.json plan.bin (plan %d)", plan.ID))
+	if err := r.applyWithReport(ctx, id, p, work); err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
 	return nil
+}
+
+// applyWithReport runs conn3x apply with -report. -report doesn't go with
+// -json, so the stream goes to a file through -json-into and is followed
+// as conn3x writes it, which conn3xexec.Conn3x.Run can't do. Cancelling
+// ctx interrupts conn3x, as Run does.
+func (r *Runner) applyWithReport(ctx context.Context, id int64, p store.Project, work string) error {
+	stream := filepath.Join(work, "stream.json")
+	f, err := os.Create(stream)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	path := p.Conn3xPath
+	if path == "" {
+		path = "conn3x"
+	}
+	cmd := exec.CommandContext(ctx, path, "apply", "-input=false", "-json-into="+stream, "-report="+r.ReportFile(id), "plan.bin")
+	cmd.Dir = work
+	cmd.Env = append(os.Environ(), p.EnvList()...)
+	cmd.Stderr = noteWriter{r, id} // stdout is the human output, which the stream repeats
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			return cmd.Process.Kill() // Windows can't interrupt
+		}
+		return nil
+	}
+	cmd.WaitDelay = 30 * time.Second
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	exited := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = cmd.Wait(); close(exited) }()
+	record := r.record(id)
+	var diags []conn3xexec.Diagnostic
+	var fnErr error
+	readErr := conn3xexec.Read(follow{f, exited}, func(ev conn3xexec.Event) error {
+		if ev.Diagnostic != nil && ev.Diagnostic.Severity == "error" {
+			diags = append(diags, *ev.Diagnostic)
+		}
+		if fnErr == nil {
+			if fnErr = record(ev); fnErr != nil {
+				cancel()
+			}
+		}
+		return nil
+	})
+	<-exited
+	if fnErr != nil {
+		return fnErr
+	}
+	var exit *exec.ExitError
+	if errors.As(waitErr, &exit) && ctx.Err() == nil {
+		return &conn3xexec.ExitError{Code: exit.ExitCode(), Diagnostics: diags}
+	}
+	if waitErr != nil {
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), waitErr)
+		}
+		return waitErr
+	}
+	return readErr
+}
+
+// follow reads a file another process is still writing, waiting at its
+// end until done is closed.
+type follow struct {
+	f    *os.File
+	done <-chan struct{}
+}
+
+func (fl follow) Read(b []byte) (int, error) {
+	for {
+		n, err := fl.f.Read(b)
+		if n > 0 || err != io.EOF {
+			return n, err
+		}
+		select {
+		case <-fl.done:
+			return fl.f.Read(b) // whatever came before it exited
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // commitSHA is a full SHA-1 or SHA-256 commit ID, all git takes here.
