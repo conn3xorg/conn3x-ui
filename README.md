@@ -68,6 +68,18 @@ Credentials need a key. Without one the UI runs, but won't save or use them:
 
 Or put the same base64 in `CONN3X_UI_KEY` instead of `-key-file`; the flag wins when both are set. The UI takes the variable out of its environment once it's read, so no run inherits it. Keep the key apart from `-data`'s backups: one without the other opens nothing. Lose the key and the saved credentials are gone; set them again.
 
+At start, the UI opens one saved credential with the key. If it won't open, the UI doesn't start, so a wrong key shows up now and not at the first run that needs it. Start without a key while credentials are saved and the log says how many, and that their projects' runs will fail until the key is back.
+
+To move to a new key, stop the UI, then re-seal every credential under it:
+
+```sh
+(umask 077; openssl rand -base64 32 > conn3x-ui.key.new)
+./conn3x-ui rotate-key -data ./data -old-key-file conn3x-ui.key -new-key-file conn3x-ui.key.new
+mv conn3x-ui.key.new conn3x-ui.key
+```
+
+`CONN3X_UI_KEY` and `CONN3X_UI_NEW_KEY` work in place of the two flags. It's one transaction: if the old key doesn't open every credential, nothing changes. The audit log records the rotation with a count, never a key or a value. Start the UI with the new key; the old one opens nothing any more, but backups of `-data` made before the rotation still need it.
+
 Listening on anything other than localhost? Put TLS in front. The session cookie is marked Secure off localhost, so plain http to another machine won't sign you in.
 
 ## A project
@@ -83,18 +95,18 @@ Your configuration needs a remote state backend: S3, Azure Blob, GCS, `pg`, `htt
 
 SSH keys, `become` passwords, cloud keys: each project keeps its own, under **Credentials** on its page. A credential has a name, a value, and how it reaches the run:
 
-- **a file**: written to a private temp directory (`0700`, the file `0600`), with its path in `CONN3X_CRED_` plus the name in upper case. A file named `ssh_key` is at `$CONN3X_CRED_SSH_KEY`.
+- **a file**: written to a private directory under `-data`'s `credentials` (`0700`, the file `0600`), with its path in `CONN3X_CRED_` plus the name in upper case. A file named `ssh_key` is at `$CONN3X_CRED_SSH_KEY`.
 - **an environment variable**: the name is the variable, such as `AWS_SECRET_ACCESS_KEY`. It wins over an environment line with the same name.
 
 Names are letters, digits and `_`, not starting with a digit, and unique in a project whatever their case. Saving a name that's there already replaces it.
 
-Values are sealed with AES-256-GCM under the key, each bound to its project and name, so a value copied to another row won't open. Once saved, the page shows a credential's name, kind and when it was set, never its value. The temp directory is removed when the run ends, however it ends. Nothing about a credential is stored with the run, and any value that turns up in a run's output or error is replaced with `<hidden>` before it's kept or shown.
+Values are sealed with AES-256-GCM under the key, each bound to its project and name, so a value copied to another row won't open. Once saved, the page shows a credential's name, kind and when it was set, never its value. The directory is removed when the run ends, however it ends; if the UI itself dies mid-run, the next start removes what's left and logs how many. Nothing about a credential is stored with the run, and any value that turns up in a run's output or error is replaced with `<hidden>` before it's kept or shown.
 
 Git gets the credentials too, so a project can bring its own deploy key: a file credential `git_key`, and a variable `GIT_SSH_COMMAND` set to `ssh -i "$CONN3X_CRED_GIT_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`. For an https token, set git's own `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0` variables, such as `http.extraHeader` and `Authorization: Bearer TOKEN`.
 
 ## What a plan does
 
-1. Writes the project's credentials into a private temp directory, then `git clone --depth 1 --branch REF URL` into another.
+1. Writes the project's credentials into a private directory under `-data`, then `git clone --depth 1 --branch REF URL` into another.
 2. `conn3x init -input=false`, then `conn3x plan -input=false -out=plan.bin`, both with `-json`.
 3. Every line of the stream goes to the database and to your browser as it arrives.
 4. When it's done, the page groups the planned actions by host, then by `circuit.step`.
@@ -225,7 +237,7 @@ Who did what, and when. **Audit**, for site admins, lists it newest first, 50 to
 - sign-ins with OIDC and the issuer, and failed ones with why, such as a state or nonce that doesn't match or an expired ID token. Never a code or a token.
 - users created, by an admin or at a first OIDC sign-in, passwords reset or changed, site admin and disabled changes, and roles given or taken away.
 - projects created, edited and deleted; drift schedule changes, and webhook changes by host only.
-- credentials set or deleted, by name.
+- credentials set or deleted, by name, and the key rotated, by count.
 - plans, applies and cancels, with the run.
 
 No password or credential value is ever in it. An entry keeps the user's and project's names as they were, so it still reads right after either is gone. The table is append-only: the database refuses to change or delete an entry.
@@ -238,7 +250,7 @@ The rest of the design, in the order it's planned:
 - Drift notifications by email, and a Check drift button: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - apt, dnf, Homebrew and Scoop packages, and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries and the image are in.
 
-Credentials are in, with the key from a file or a variable; a KMS for the key comes later, also under [#891](https://github.com/conn3xorg/conn3x/issues/891).
+Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).
 
 Until then, treat it as a lab tool: runs on the UI's own host.
 

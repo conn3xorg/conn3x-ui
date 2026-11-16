@@ -15,7 +15,8 @@ import (
 )
 
 func TestWriteCredentials(t *testing.T) {
-	dir, env, err := writeCredentials([]store.Secret{
+	parent := t.TempDir()
+	dir, env, err := writeCredentials(parent, []store.Secret{
 		{Name: "ssh_key", Kind: store.CredFile, Value: []byte("key\n")},
 		{Name: "AWS_SECRET_ACCESS_KEY", Kind: store.CredEnv, Value: []byte("aws")},
 	})
@@ -23,6 +24,9 @@ func TestWriteCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
+	if filepath.Dir(dir) != parent {
+		t.Errorf("dir %s isn't in %s", dir, parent)
+	}
 	path := filepath.Join(dir, "ssh_key")
 	if !slices.Equal(env, []string{"CONN3X_CRED_SSH_KEY=" + path, "AWS_SECRET_ACCESS_KEY=aws"}) {
 		t.Errorf("env %q", env)
@@ -36,7 +40,7 @@ func TestWriteCredentials(t *testing.T) {
 	if b, _ := os.ReadFile(path); string(b) != "key\n" {
 		t.Errorf("file holds %q", b)
 	}
-	if _, _, err := writeCredentials([]store.Secret{{Name: "../x", Kind: store.CredFile}}); err == nil {
+	if _, _, err := writeCredentials(parent, []store.Secret{{Name: "../x", Kind: store.CredFile}}); err == nil {
 		t.Error("a name with a path in it was written")
 	}
 }
@@ -48,6 +52,47 @@ func TestHider(t *testing.T) {
 	for _, in := range []string{key, string(quoted), "line: AAAAsecret<&>", `{"@message":"tok\"en"}`} {
 		if out := h.Replace(in); strings.Contains(out, "AAAAsecret") || strings.Contains(out, "tok") || !strings.Contains(out, "<hidden>") {
 			t.Errorf("%q became %q", in, out)
+		}
+	}
+}
+
+func TestRemoveLeftovers(t *testing.T) {
+	data, outside := t.TempDir(), t.TempDir()
+	r := &Runner{DataDir: data}
+	if n, err := r.RemoveLeftovers(); n != 0 || err != nil {
+		t.Errorf("no credentials directory yet: %d %v", n, err)
+	}
+	// Two runs that died with their credentials still on disk.
+	for range 2 {
+		if _, _, err := writeCredentials(r.credentialsDir(), []store.Secret{{Name: "k", Kind: store.CredFile, Value: []byte("v")}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// And what the UI didn't make: a file and a directory without the
+	// prefix, a link with it, and a credentials-named directory outside.
+	keep := []string{
+		filepath.Join(r.credentialsDir(), "notes"),
+		filepath.Join(r.credentialsDir(), "other-dir"),
+		filepath.Join(r.credentialsDir(), credPrefix+"link"),
+		filepath.Join(data, credPrefix+"x"),
+		filepath.Join(outside, credPrefix+"y"),
+	}
+	os.WriteFile(keep[0], nil, 0o600)
+	os.Mkdir(keep[1], 0o700)
+	os.Symlink(outside, keep[2])
+	os.Mkdir(keep[3], 0o700)
+	os.Mkdir(keep[4], 0o700)
+
+	if n, err := r.RemoveLeftovers(); n != 2 || err != nil {
+		t.Errorf("removed %d: %v", n, err)
+	}
+	entries, _ := os.ReadDir(r.credentialsDir())
+	if len(entries) != 3 {
+		t.Errorf("left %v", entries)
+	}
+	for _, k := range keep {
+		if _, err := os.Lstat(k); err != nil {
+			t.Errorf("%s: %v", k, err)
 		}
 	}
 }
