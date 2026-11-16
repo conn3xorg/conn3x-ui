@@ -7,7 +7,7 @@
   <table>
     <tr><th>Name</th><th>Access</th><th>Password</th></tr>
     {{range .Data.Users}}
-    <tr><td>{{.Name}}{{if .Disabled}} <small>disabled</small>{{end}}</td>
+    <tr><td>{{.Name}}{{if .OIDC}} <small>OIDC</small>{{end}}{{if .Disabled}} <small>disabled</small>{{end}}</td>
       <td><form method="post" action="/users/{{.ID}}">
         <input type="hidden" name="csrf" value="{{$.CSRF}}">
         <label><input type="checkbox" name="admin" value="1" style="width:auto"{{if .Admin}} checked{{end}}> Site admin</label>
@@ -19,7 +19,7 @@
         <button>Reset</button></form></td></tr>
     {{end}}
   </table>
-  <p><small>A site admin manages users, reads the audit log, and is admin on every project. Everyone else sees only the projects they have a role on.</small></p>
+  <p><small>A site admin manages users, reads the audit log, and is admin on every project. Everyone else sees only the projects they have a role on. Someone who signs in with OIDC gets a user here the first time, with no roles.</small></p>
 </section>
 <section>
   <h2>New user</h2>

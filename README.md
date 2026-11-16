@@ -169,12 +169,61 @@ Four eyes on every apply, then: a plan made by a planner needs an approver or an
 
 The server checks the role on every page and button, not just the browser. A button you can't use isn't shown, and posting it anyway gets a 403 that says which role you'd need.
 
+## Single sign-on with OIDC
+
+Rather your people signed in with the accounts they already have? Point the UI at one OpenID Connect provider:
+
+```sh
+(umask 077; printf '%s' 'CLIENT_SECRET' > oidc-secret)
+./conn3x-ui serve -listen 127.0.0.1:8080 -data ./data \
+  -oidc-issuer https://sso.example.com/realms/ops \
+  -oidc-client-id conn3x-ui \
+  -oidc-client-secret-file oidc-secret \
+  -oidc-redirect-url https://conn3x.example.com/login/oidc/callback
+```
+
+The sign-in page gets a **Sign in with single sign-on** button. The UI reads the provider's `/.well-known/openid-configuration` when it starts, so the provider has to be up then.
+
+- `-oidc-redirect-url` is this UI's address plus `/login/oidc/callback`. Register exactly that with the provider.
+- The client secret comes from `-oidc-client-secret-file`, or from `CONN3X_UI_OIDC_CLIENT_SECRET`, which the UI takes out of its environment once read, as it does the key. A public client, with no secret, works too: every sign-in uses PKCE.
+- The UI asks for the scopes `openid email profile`.
+- `-oidc-email-domain example.com` lets in only people whose email is in that domain and marked verified by the provider.
+
+Each sign-in uses the authorization code flow with PKCE (S256), a `state` and a `nonce`, carried to the callback in a signed, HttpOnly cookie that lasts 10 minutes. The ID token's signature is checked against the provider's published keys, along with its issuer, audience, expiry and nonce. The UI keeps no token, and logs none.
+
+The first time someone signs in, the UI makes them a user, named from their `preferred_username` or email, with no roles and no site admin. A site admin gives them roles as for anyone else; the user list marks them **OIDC**. The user is tied to the provider's issuer and subject, never their email or name, so a new account with an old colleague's email is a new user. If the name is taken, a short hash goes on the end.
+
+### Keycloak
+
+In your realm, create a client:
+
+1. **Client ID** `conn3x-ui`, **Client authentication** on, **Standard flow** only.
+2. **Valid redirect URIs**: `https://conn3x.example.com/login/oidc/callback`.
+3. Copy the secret from **Credentials**.
+
+The issuer is `https://KEYCLOAK/realms/REALM`. Set the client's **PKCE Method** to `S256` and Keycloak refuses any sign-in to it without PKCE.
+
+### Entra ID
+
+Under **App registrations**, register an app:
+
+1. **Supported account types**: this organizational directory only.
+2. **Redirect URI**: platform **Web**, `https://conn3x.example.com/login/oidc/callback`.
+3. Under **Certificates & secrets**, make a client secret and copy its value.
+
+The issuer is `https://login.microsoftonline.com/TENANT_ID/v2.0` and the client ID is the app's **Application (client) ID**. A single-tenant app already keeps out anyone outside your directory, and Entra doesn't say whether an email is verified, so leave `-oidc-email-domain` off.
+
+### Turning off passwords
+
+Once single sign-on works, you can turn off password sign-in with `-no-password-sign-in`. It won't lock you out: the UI refuses to start with it until a site admin who isn't disabled signs in with OIDC. So sign in with OIDC once, make that user a site admin under **Users** while signed in as `admin`, then restart with the flag. While it's on, the last such admin can't lose their admin or be disabled.
+
 ## Audit log
 
 Who did what, and when. **Audit**, for site admins, lists it newest first, 50 to a page, filtered by user and project. It records:
 
 - sign-in, sign-out, and failed sign-ins, with why: a wrong password, a disabled account, or a name nobody has. That last one doesn't keep the name, in case it was a password typed in the wrong box.
-- users created, passwords reset or changed, site admin and disabled changes, and roles given or taken away.
+- sign-ins with OIDC and the issuer, and failed ones with why, such as a state or nonce that doesn't match or an expired ID token. Never a code or a token.
+- users created, by an admin or at a first OIDC sign-in, passwords reset or changed, site admin and disabled changes, and roles given or taken away.
 - projects created, edited and deleted; drift schedule changes, and webhook changes by host only.
 - credentials set or deleted, by name.
 - plans, applies and cancels, with the run.
@@ -185,13 +234,13 @@ No password or credential value is ever in it. An entry keeps the user's and pro
 
 The rest of the design, in the order it's planned:
 
-- OIDC sign-in (Keycloak, Entra ID, Google, GitHub), roles for groups, and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, roles per person and the audit log are in.
+- Roles for OIDC groups, more than one provider (GitHub, which isn't OIDC, among them), and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and the audit log are in.
 - Drift notifications by email, and a Check drift button: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - apt, dnf, Homebrew and Scoop packages, and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries and the image are in.
 
 Credentials are in, with the key from a file or a variable; a KMS for the key comes later, also under [#891](https://github.com/conn3xorg/conn3x/issues/891).
 
-Until then, treat it as a lab tool: local accounts, runs on the UI's own host.
+Until then, treat it as a lab tool: runs on the UI's own host.
 
 ## Developing
 

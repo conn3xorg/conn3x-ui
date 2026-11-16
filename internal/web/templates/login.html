@@ -1,13 +1,16 @@
 {{define "title"}}Sign in{{end}}
 {{define "content"}}
 <h1>Sign in</h1>
+{{if .Data.OIDC}}<form method="get" action="/login/oidc"><p><button class="primary">Sign in with single sign-on</button></p></form>{{end}}
+{{if .Data.Password}}
 <form method="post" action="/login" style="max-width: 24rem">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <label for="name">Name</label>
-  <input id="name" name="name" autocomplete="username" required autofocus>
+  <input id="name" name="name" autocomplete="username" required{{if not .Data.OIDC}} autofocus{{end}}>
   <label for="password">Password</label>
   <input id="password" name="password" type="password" autocomplete="current-password" required>
-  <p><button class="primary">Sign in</button></p>
+  <p><button{{if not .Data.OIDC}} class="primary"{{end}}>Sign in</button></p>
   <small>First time? The admin password was printed to the log when conn3x-ui started.</small>
 </form>
+{{end}}
 {{end}}

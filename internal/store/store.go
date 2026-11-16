@@ -135,6 +135,11 @@ var migrations = []string{
 	CREATE INDEX audit_project ON audit(project_id, id);
 	CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
 	CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;`,
+	// 7: the OIDC account a user signs in with, by issuer and subject. A
+	// user made from OIDC has no password: an empty hash matches none.
+	`ALTER TABLE users ADD COLUMN oidc_issuer TEXT;
+	ALTER TABLE users ADD COLUMN oidc_subject TEXT;
+	CREATE UNIQUE INDEX users_oidc ON users(oidc_issuer, oidc_subject);`,
 }
 
 // Store is the database.
@@ -688,7 +693,7 @@ func (s *Store) Secrets(ctx context.Context, projectID int64) ([]Secret, error) 
 }
 
 // User is someone who can sign in.
-// shortcut: local accounts only; OIDC sign-in and groups are the rest of
+// shortcut: roles per person only; roles for OIDC groups are the rest of
 // #892.
 type User struct {
 	ID   int64
@@ -698,13 +703,15 @@ type User struct {
 	Admin bool
 	// Disabled can't sign in.
 	Disabled bool
+	// OIDC is true when the user signs in with OIDC.
+	OIDC bool
 }
 
-const userCols = "id, name, admin, disabled"
+const userCols = "id, name, admin, disabled, oidc_subject IS NOT NULL"
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Name, &u.Admin, &u.Disabled)
+	err := row.Scan(&u.ID, &u.Name, &u.Admin, &u.Disabled, &u.OIDC)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -843,10 +850,40 @@ func (s *Store) Login(ctx context.Context, name, password string, ttl time.Durat
 	if !matches(hash, password) || disabled {
 		return "", "", ErrNotFound
 	}
+	return s.OpenSession(ctx, id, ttl)
+}
+
+// OpenSession opens a session for a user who has signed in. It returns the
+// session token and its CSRF token.
+func (s *Store) OpenSession(ctx context.Context, userID int64, ttl time.Duration) (token, csrf string, err error) {
 	token, csrf = Token(32), Token(32)
 	_, err = s.db.ExecContext(ctx, "INSERT INTO sessions (token, user_id, csrf, expires_at) VALUES (?, ?, ?, ?)",
-		token, id, csrf, time.Now().UTC().Add(ttl).Format(time.RFC3339))
+		token, userID, csrf, time.Now().UTC().Add(ttl).Format(time.RFC3339))
 	return token, csrf, err
+}
+
+// OIDCUser returns the user linked to an OIDC issuer and subject.
+func (s *Store) OIDCUser(ctx context.Context, issuer, subject string) (User, error) {
+	return scanUser(s.db.QueryRowContext(ctx, "SELECT "+userCols+" FROM users WHERE oidc_issuer=? AND oidc_subject=?", issuer, subject))
+}
+
+// CreateOIDCUser adds a user who signs in with OIDC as issuer and subject.
+// Like CreateUser, they aren't an admin and have no role on any project.
+func (s *Store) CreateOIDCUser(ctx context.Context, name, issuer, subject string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, "INSERT INTO users (name, password_hash, created_at, oidc_issuer, oidc_subject) VALUES (?, '', ?, ?, ?)",
+		name, now(), issuer, subject)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// OIDCAdmins says how many site admins who aren't disabled sign in with
+// OIDC from issuer.
+func (s *Store) OIDCAdmins(ctx context.Context, issuer string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE admin = 1 AND disabled = 0 AND oidc_issuer=?", issuer).Scan(&n)
+	return n, err
 }
 
 // Session returns the user and CSRF token of a live session of a user who
@@ -854,8 +891,8 @@ func (s *Store) Login(ctx context.Context, name, password string, ttl time.Durat
 func (s *Store) Session(ctx context.Context, token string) (User, string, error) {
 	var u User
 	var csrf string
-	err := s.db.QueryRowContext(ctx, "SELECT u.id, u.name, u.admin, u.disabled, s.csrf FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=? AND s.expires_at > ? AND u.disabled = 0",
-		token, now()).Scan(&u.ID, &u.Name, &u.Admin, &u.Disabled, &csrf)
+	err := s.db.QueryRowContext(ctx, "SELECT u.id, u.name, u.admin, u.disabled, u.oidc_subject IS NOT NULL, s.csrf FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=? AND s.expires_at > ? AND u.disabled = 0",
+		token, now()).Scan(&u.ID, &u.Name, &u.Admin, &u.Disabled, &u.OIDC, &csrf)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
