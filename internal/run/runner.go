@@ -269,96 +269,11 @@ func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan st
 		return err
 	}
 	r.note(id, fmt.Sprintf("conn3x apply -input=false -report=report.json plan.bin (plan %d)", plan.ID))
-	if err := r.applyWithReport(ctx, id, p, work); err != nil {
+	// -report doesn't go with -json, so the stream goes to a file instead.
+	if err := c.RunInto(ctx, r.record(id), filepath.Join(work, "stream.json"), "apply", "-input=false", "-report="+r.ReportFile(id), "plan.bin"); err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
 	return nil
-}
-
-// applyWithReport runs conn3x apply with -report. -report doesn't go with
-// -json, so the stream goes to a file through -json-into and is followed
-// as conn3x writes it, which conn3xexec.Conn3x.Run can't do. Cancelling
-// ctx interrupts conn3x, as Run does.
-func (r *Runner) applyWithReport(ctx context.Context, id int64, p store.Project, work string) error {
-	stream := filepath.Join(work, "stream.json")
-	f, err := os.Create(stream)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	path := p.Conn3xPath
-	if path == "" {
-		path = "conn3x"
-	}
-	cmd := exec.CommandContext(ctx, path, "apply", "-input=false", "-json-into="+stream, "-report="+r.ReportFile(id), "plan.bin")
-	cmd.Dir = work
-	cmd.Env = append(os.Environ(), p.EnvList()...)
-	cmd.Stderr = noteWriter{r, id} // stdout is the human output, which the stream repeats
-	cmd.Cancel = func() error {
-		if err := cmd.Process.Signal(os.Interrupt); err != nil {
-			return cmd.Process.Kill() // Windows can't interrupt
-		}
-		return nil
-	}
-	cmd.WaitDelay = 30 * time.Second
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	exited := make(chan struct{})
-	var waitErr error
-	go func() { waitErr = cmd.Wait(); close(exited) }()
-	record := r.record(id)
-	var diags []conn3xexec.Diagnostic
-	var fnErr error
-	readErr := conn3xexec.Read(follow{f, exited}, func(ev conn3xexec.Event) error {
-		if ev.Diagnostic != nil && ev.Diagnostic.Severity == "error" {
-			diags = append(diags, *ev.Diagnostic)
-		}
-		if fnErr == nil {
-			if fnErr = record(ev); fnErr != nil {
-				cancel()
-			}
-		}
-		return nil
-	})
-	<-exited
-	if fnErr != nil {
-		return fnErr
-	}
-	var exit *exec.ExitError
-	if errors.As(waitErr, &exit) && ctx.Err() == nil {
-		return &conn3xexec.ExitError{Code: exit.ExitCode(), Diagnostics: diags}
-	}
-	if waitErr != nil {
-		if ctx.Err() != nil {
-			return errors.Join(ctx.Err(), waitErr)
-		}
-		return waitErr
-	}
-	return readErr
-}
-
-// follow reads a file another process is still writing, waiting at its
-// end until done is closed.
-type follow struct {
-	f    *os.File
-	done <-chan struct{}
-}
-
-func (fl follow) Read(b []byte) (int, error) {
-	for {
-		n, err := fl.f.Read(b)
-		if n > 0 || err != io.EOF {
-			return n, err
-		}
-		select {
-		case <-fl.done:
-			return fl.f.Read(b) // whatever came before it exited
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
 }
 
 // commitSHA is a full SHA-1 or SHA-256 commit ID, all git takes here.
