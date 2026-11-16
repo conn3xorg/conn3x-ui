@@ -2,6 +2,8 @@
 {{define "content"}}
 <h1>{{.User.Name}}</h1>
 {{with .Data}}<p class="shown">{{.}}</p>{{end}}
+{{if .User.OIDC}}<p>You sign in with single sign-on, so there's no password to change here.</p>
+{{else}}
 <h2>Change your password</h2>
 <form method="post" action="/account/password" style="max-width: 24rem">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -12,4 +14,5 @@
   <small>At least 12 characters. Your other sessions are signed out.</small>
   <p><button class="primary">Change password</button></p>
 </form>
+{{end}}
 {{end}}

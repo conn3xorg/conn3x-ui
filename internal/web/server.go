@@ -42,8 +42,12 @@ type Server struct {
 	Store  *store.Store
 	Runner *run.Runner
 	Log    *log.Logger
-	pages  map[string]*template.Template
-	mux    *http.ServeMux
+	// OIDC, when set, offers sign-in with an OpenID Connect provider.
+	OIDC *OIDC
+	// PasswordOff turns off sign-in with a password, leaving OIDC.
+	PasswordOff bool
+	pages       map[string]*template.Template
+	mux         *http.ServeMux
 	// cop rejects cross-site POSTs by their Sec-Fetch-Site and Origin
 	// headers, a second guard beside the CSRF tokens.
 	cop http.CrossOriginProtection
@@ -77,6 +81,8 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.Handle("GET /static/", http.FileServerFS(files))
 	s.mux.HandleFunc("GET /login", s.loginPage)
 	s.mux.HandleFunc("POST /login", s.login)
+	s.mux.HandleFunc("GET /login/oidc", s.oidcStart)
+	s.mux.HandleFunc("GET /login/oidc/callback", s.oidcCallback)
 	s.mux.HandleFunc("POST /logout", s.logout)
 	s.mux.HandleFunc("GET /{$}", s.projects)
 	s.mux.HandleFunc("POST /projects", s.createProject)
@@ -106,8 +112,6 @@ func New(st *store.Store, rn *run.Runner) *Server {
 
 // ServeHTTP signs the request in and checks CSRF, then routes it. Each
 // handler checks the user's role itself.
-// shortcut: local accounts and a session cookie; OIDC sign-in is the rest
-// of #892.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// No page may be framed, so a button can't be clicked through an overlay.
 	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
@@ -117,7 +121,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/login" {
+	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/login" || strings.HasPrefix(r.URL.Path, "/login/oidc") {
 		if r.Method == http.MethodPost && !sameToken(r.PostFormValue("csrf"), cookie(r, "csrf")) {
 			http.Error(w, "the sign-in form expired; go back and try again", http.StatusForbidden)
 			return
@@ -248,12 +252,27 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
+	s.loginForm(w, r, http.StatusOK, "")
+}
+
+// loginForm renders the sign-in page with a new CSRF token.
+func (s *Server) loginForm(w http.ResponseWriter, r *http.Request, status int, errMsg string) {
 	csrf := store.Token(32)
 	setCookie(w, r, "csrf", csrf, time.Hour)
-	s.pages["login"].ExecuteTemplate(w, "layout", page{CSRF: csrf})
+	s.loginRender(w, status, csrf, errMsg)
+}
+
+func (s *Server) loginRender(w http.ResponseWriter, status int, csrf, errMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	s.pages["login"].ExecuteTemplate(w, "layout", page{CSRF: csrf, Error: errMsg, Data: map[string]bool{"Password": !s.PasswordOff, "OIDC": s.OIDC != nil}})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	if s.PasswordOff {
+		http.Error(w, "sign-in with a password is off; use single sign-on", http.StatusForbidden)
+		return
+	}
 	name := r.PostFormValue("name")
 	tok, _, err := s.Store.Login(r.Context(), name, r.PostFormValue("password"), sessionTTL)
 	// Only a name somebody has goes in the log, so a password typed into
@@ -267,8 +286,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			why = "disabled user"
 		}
 		s.audit(r.Context(), u, store.Project{}, "sign-in failed", why)
-		w.WriteHeader(http.StatusUnauthorized)
-		s.pages["login"].ExecuteTemplate(w, "layout", page{CSRF: cookie(r, "csrf"), Error: "That name and password don't match."})
+		s.loginRender(w, http.StatusUnauthorized, cookie(r, "csrf"), "That name and password don't match.")
 		return
 	}
 	if err != nil {
