@@ -3,3 +3,4 @@ data/
 *.db-shm
 *.db-wal
 conn3x-ui
+dist/
