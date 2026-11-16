@@ -257,6 +257,17 @@ func projectForm(r *http.Request) (store.Project, error) {
 		env = append(env, l)
 	}
 	p.Env = strings.Join(env, "\n")
+	p.Schedule = strings.Join(strings.Fields(r.PostFormValue("schedule")), " ")
+	if p.Schedule != "" {
+		if _, err := run.ParseSchedule(p.Schedule); err != nil {
+			return p, err
+		}
+	}
+	if p.WebhookURL = f("webhook_url", ""); p.WebhookURL != "" {
+		if err := run.ValidateWebhookURL(p.WebhookURL); err != nil {
+			return p, err
+		}
+	}
 	return p, nil
 }
 
@@ -317,6 +328,10 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	form, err := projectForm(r)
 	form.ID = p.ID
+	// The page never shows the saved webhook URL, so a blank field keeps it.
+	if form.WebhookURL == "" && r.PostFormValue("webhook_clear") == "" {
+		form.WebhookURL = p.WebhookURL
+	}
 	if err == nil {
 		err = s.Store.UpdateProject(r.Context(), form)
 	}
@@ -507,7 +522,7 @@ func (s *Server) runReport(w http.ResponseWriter, r *http.Request) {
 const historyPage = 50
 
 // history is every run across projects, newest first, filtered by
-// project, host and status.
+// project, host and status or drift check outcome.
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.Filter{Host: strings.TrimSpace(q.Get("host")), Status: q.Get("status")}
@@ -540,7 +555,7 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		return "/runs?" + v.Encode()
 	}
 	d := map[string]any{"Runs": runs, "Projects": ps, "Filter": f, "Page": pg,
-		"Statuses": []string{store.StatusQueued, store.StatusRunning, store.StatusSucceeded, store.StatusFailed, store.StatusCancelled}}
+		"Statuses": []string{store.StatusQueued, store.StatusRunning, store.StatusSucceeded, store.StatusFailed, store.StatusCancelled, store.OutcomeDrift, store.OutcomeClean}}
 	if pg > 1 {
 		d["Prev"] = link(pg - 1)
 	}

@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -97,6 +98,11 @@ var migrations = []string{
 		set_at TEXT NOT NULL,
 		PRIMARY KEY (project_id, name)
 	);`,
+	// 5: a drift check schedule and a webhook per project, and how a drift
+	// check came out.
+	`ALTER TABLE projects ADD COLUMN schedule TEXT NOT NULL DEFAULT '';
+	ALTER TABLE projects ADD COLUMN webhook_url TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN outcome TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is the database.
@@ -164,9 +170,23 @@ type Project struct {
 	Conn3xPath string
 	// Env is KEY=VALUE lines the runs get, in plain text. Secrets go in
 	// the project's credentials instead.
-	Env       string
-	CreatedAt string
-	UpdatedAt string
+	Env string
+	// Schedule is when drift checks run, "" for never: an interval or
+	// five cron fields, as run.ParseSchedule reads them.
+	Schedule string
+	// WebhookURL gets a POST when a drift check finds drift or fails. It
+	// may hold a token, so pages show only its host.
+	WebhookURL string
+	CreatedAt  string
+	UpdatedAt  string
+}
+
+// WebhookHost is the webhook URL's host, all a page shows of it.
+func (p Project) WebhookHost() string {
+	if u, err := url.Parse(p.WebhookURL); err == nil {
+		return u.Host
+	}
+	return ""
 }
 
 // EnvList is Env as the []string os/exec wants, blank lines dropped.
@@ -180,11 +200,11 @@ func (p Project) EnvList() []string {
 	return out
 }
 
-const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, created_at, updated_at"
+const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, created_at, updated_at"
 
 func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 	var p Project
-	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -194,8 +214,8 @@ func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 // CreateProject adds p and returns its ID.
 func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 	t := now()
-	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, t, t)
+	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, t, t)
 	if err != nil {
 		return 0, err
 	}
@@ -204,8 +224,8 @@ func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 
 // UpdateProject saves p's fields over the project with p.ID.
 func (s *Store) UpdateProject(ctx context.Context, p Project) error {
-	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, updated_at=? WHERE id=?",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, now(), p.ID)
+	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, updated_at=? WHERE id=?",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, now(), p.ID)
 	if err != nil {
 		return err
 	}
@@ -259,10 +279,18 @@ const (
 	StatusCancelled = "cancelled"
 )
 
-// Run kinds.
+// Run kinds. A drift check is a plan -refresh-only that its project's
+// schedule starts.
 const (
 	KindPlan  = "plan"
 	KindApply = "apply"
+	KindDrift = "drift"
+)
+
+// Drift check outcomes: drift when a host no longer matches the state.
+const (
+	OutcomeDrift = "drift"
+	OutcomeClean = "clean"
 )
 
 // Run is one conn3x run: a plan, or an apply of a plan run's saved plan.
@@ -285,6 +313,9 @@ type Run struct {
 	ApprovedBy     sql.NullInt64
 	ApprovedByName sql.NullString
 	ApprovedAt     sql.NullString
+	// Outcome is a finished drift check's OutcomeDrift or OutcomeClean, and
+	// "" for anything else.
+	Outcome string
 	// HostOutcome is how the run came out on the host History was asked
 	// about, and "" from anything else.
 	HostOutcome string
@@ -297,23 +328,24 @@ func (r Run) Finished() bool {
 
 const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, " +
 	"(SELECT name FROM users WHERE users.id = runs.created_by), (SELECT name FROM projects WHERE projects.id = runs.project_id), created_at, started_at, finished_at, " +
-	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at"
+	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at, outcome"
 
 // scanRun reads runCols, then any extra columns into extra.
 func scanRun(row interface{ Scan(...any) error }, extra ...any) (Run, error) {
 	var r Run
 	err := row.Scan(append([]any{&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedByName, &r.ProjectName, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
-		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt}, extra...)...)
+		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt, &r.Outcome}, extra...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
 	return r, err
 }
 
-// CreateRun adds a queued run and returns its ID.
+// CreateRun adds a queued run and returns its ID. userID 0 is the
+// schedule, not a person.
 func (s *Store) CreateRun(ctx context.Context, projectID int64, kind string, userID int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-		projectID, kind, StatusQueued, userID, now())
+		projectID, kind, StatusQueued, sql.NullInt64{Int64: userID, Valid: userID != 0}, now())
 	if err != nil {
 		return 0, err
 	}
@@ -376,6 +408,17 @@ func (s *Store) FinishRun(ctx context.Context, id int64, status, errMsg string) 
 	return err
 }
 
+// SetRunOutcome records how a drift check came out.
+func (s *Store) SetRunOutcome(ctx context.Context, id int64, outcome string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE runs SET outcome=? WHERE id=?", outcome, id)
+	return err
+}
+
+// LastRun returns a project's newest run of kind.
+func (s *Store) LastRun(ctx context.Context, projectID int64, kind string) (Run, error) {
+	return scanRun(s.db.QueryRowContext(ctx, "SELECT "+runCols+" FROM runs WHERE project_id=? AND kind=? ORDER BY id DESC LIMIT 1", projectID, kind))
+}
+
 // Run returns one run.
 func (s *Store) Run(ctx context.Context, id int64) (Run, error) {
 	return scanRun(s.db.QueryRowContext(ctx, "SELECT "+runCols+" FROM runs WHERE id=?", id))
@@ -418,7 +461,8 @@ func (s *Store) SetRunHosts(ctx context.Context, id int64, outcomes map[string]s
 	return tx.Commit()
 }
 
-// Filter narrows History. A zero field matches every run.
+// Filter narrows History. A zero field matches every run. Status matches
+// a run's status or its drift check outcome.
 type Filter struct {
 	ProjectID int64
 	Host      string
@@ -430,7 +474,7 @@ type Filter struct {
 // each run's HostOutcome is how it came out on that host.
 func (s *Store) History(ctx context.Context, f Filter, limit, offset int) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT "+runCols+", COALESCE((SELECT outcome FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3), '') FROM runs "+
-		"WHERE (?1 = 0 OR project_id = ?1) AND (?2 = '' OR status = ?2) AND (?3 = '' OR EXISTS (SELECT 1 FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3)) "+
+		"WHERE (?1 = 0 OR project_id = ?1) AND (?2 = '' OR status = ?2 OR outcome = ?2) AND (?3 = '' OR EXISTS (SELECT 1 FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3)) "+
 		"ORDER BY id DESC LIMIT ?4 OFFSET ?5", f.ProjectID, f.Status, f.Host, limit, offset)
 	if err != nil {
 		return nil, err

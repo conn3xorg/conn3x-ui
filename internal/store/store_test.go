@@ -307,3 +307,74 @@ func TestMigrateTwice(t *testing.T) {
 		s.Close()
 	}
 }
+
+func TestDriftChecks(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	pid, _ := s.CreateProject(ctx, Project{Name: "web", Schedule: "6h", WebhookURL: "https://hooks.example.com:8443/T000/SECRET"})
+	p, err := s.Project(ctx, pid)
+	if err != nil || p.Schedule != "6h" || p.WebhookURL != "https://hooks.example.com:8443/T000/SECRET" || p.WebhookHost() != "hooks.example.com:8443" {
+		t.Fatalf("%+v %v", p, err)
+	}
+	p.Schedule, p.WebhookURL = "0 3 * * *", ""
+	s.UpdateProject(ctx, p)
+	if p, _ = s.Project(ctx, pid); p.Schedule != "0 3 * * *" || p.WebhookURL != "" || p.WebhookHost() != "" {
+		t.Errorf("%+v", p)
+	}
+
+	if _, err := s.LastRun(ctx, pid, KindDrift); !errors.Is(err, ErrNotFound) {
+		t.Errorf("no drift check yet: %v", err)
+	}
+	uid, _ := s.CreateUser(ctx, "admin", "pw")
+	plan, _ := s.CreateRun(ctx, pid, KindPlan, uid)
+	d1, err := s.CreateRun(ctx, pid, KindDrift, 0) // the schedule, nobody's
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := s.CreateRun(ctx, pid, KindDrift, 0)
+	s.SetRunOutcome(ctx, d1, OutcomeClean)
+	s.SetRunOutcome(ctx, d2, OutcomeDrift)
+	s.FinishRun(ctx, d2, StatusSucceeded, "")
+	last, err := s.LastRun(ctx, pid, KindDrift)
+	if err != nil || last.ID != d2 || last.Outcome != OutcomeDrift || last.CreatedBy.Valid {
+		t.Errorf("%+v %v", last, err)
+	}
+	// A drift check doesn't retire the plan before it.
+	if ok, _ := s.Applicable(ctx, plan); ok {
+		t.Error("an unfinished plan is applicable")
+	}
+	s.FinishRun(ctx, plan, StatusSucceeded, "")
+	if ok, _ := s.Applicable(ctx, plan); !ok {
+		t.Error("a drift check retired the plan")
+	}
+	for status, want := range map[string]int64{OutcomeDrift: d2, OutcomeClean: d1} {
+		if runs, _ := s.History(ctx, Filter{Status: status}, 10, 0); len(runs) != 1 || runs[0].ID != want {
+			t.Errorf("%s: %+v", status, runs)
+		}
+	}
+}
+
+// TestMigrateKeepsProjects opens a database from before schedules and
+// finds its projects with none.
+func TestMigrateKeepsProjects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ui.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("ALTER TABLE projects DROP COLUMN schedule; ALTER TABLE projects DROP COLUMN webhook_url; ALTER TABLE runs DROP COLUMN outcome; PRAGMA user_version = 4"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("INSERT INTO projects (name, git_url, git_ref, path, conn3x_path, env, created_at, updated_at) VALUES ('old', 'u', 'main', '.', 'conn3x', '', 't', 't')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ps, err := s.Projects(context.Background())
+	if err != nil || len(ps) != 1 || ps[0].Name != "old" || ps[0].Schedule != "" || ps[0].WebhookURL != "" {
+		t.Errorf("%+v %v", ps, err)
+	}
+}
