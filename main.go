@@ -24,9 +24,16 @@ import (
 	"github.com/conn3xorg/conn3x-ui/internal/web"
 )
 
+// version is the release, set at build time; a plain go build says dev.
+var version = "dev"
+
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		fmt.Println("conn3x-ui", version)
+		return
+	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE]")
+		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE]\n       conn3x-ui version")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
