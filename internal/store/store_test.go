@@ -574,3 +574,100 @@ func TestMigrateKeepsAdmin(t *testing.T) {
 		t.Error("a new user is an admin")
 	}
 }
+
+func TestCheckKey(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	if n, err := s.CheckKey(ctx); n != 0 || err != nil {
+		t.Errorf("no key, nothing saved: %d %v", n, err)
+	}
+	key := make([]byte, 32)
+	rand.Read(key)
+	s.SetKey(key)
+	pid, _ := s.CreateProject(ctx, Project{Name: "p"})
+	s.SetCredential(ctx, pid, "TOKEN", CredEnv, []byte("tok-1"))
+	if n, err := s.CheckKey(ctx); n != 1 || err != nil {
+		t.Errorf("right key: %d %v", n, err)
+	}
+	s.aead = nil
+	if n, err := s.CheckKey(ctx); n != 1 || err != nil {
+		t.Errorf("no key says how many are saved: %d %v", n, err)
+	}
+	other := make([]byte, 32)
+	rand.Read(other)
+	s.SetKey(other)
+	if _, err := s.CheckKey(ctx); err == nil || !strings.Contains(err.Error(), "rotate-key") || strings.Contains(err.Error(), "tok") {
+		t.Errorf("wrong key: %v", err)
+	}
+}
+
+func TestRotateKey(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	oldKey, newKey, wrong := make([]byte, 32), make([]byte, 32), make([]byte, 32)
+	rand.Read(oldKey)
+	rand.Read(newKey)
+	rand.Read(wrong)
+	if _, err := s.RotateKey(ctx, newKey); !errors.Is(err, ErrNoKey) {
+		t.Errorf("rotate without a key: %v", err)
+	}
+	s.SetKey(oldKey)
+	p, _ := s.CreateProject(ctx, Project{Name: "p"})
+	q, _ := s.CreateProject(ctx, Project{Name: "q"})
+	s.SetCredential(ctx, p, "ssh_key", CredFile, []byte("key one\n"))
+	s.SetCredential(ctx, p, "TOKEN", CredEnv, []byte("tok-1"))
+	s.SetCredential(ctx, q, "TOKEN", CredEnv, []byte("tok-2"))
+	sealed := func() string {
+		var b strings.Builder
+		rows, _ := s.db.Query("SELECT value FROM credentials ORDER BY project_id, name")
+		defer rows.Close()
+		for rows.Next() {
+			var v []byte
+			rows.Scan(&v)
+			b.Write(v)
+		}
+		return b.String()
+	}
+
+	// A wrong old key changes nothing, and logs nothing.
+	before := sealed()
+	s.SetKey(wrong)
+	if _, err := s.RotateKey(ctx, newKey); err == nil || strings.Contains(err.Error(), "tok") {
+		t.Errorf("wrong old key: %v", err)
+	}
+	if sealed() != before {
+		t.Error("a failed rotation changed a value")
+	}
+	if log, _ := s.AuditLog(ctx, AuditFilter{}, 10, 0); len(log) != 0 {
+		t.Errorf("a failed rotation was logged: %+v", log)
+	}
+
+	s.SetKey(oldKey)
+	if n, err := s.RotateKey(ctx, newKey); n != 3 || err != nil {
+		t.Fatalf("rotate: %d %v", n, err)
+	}
+	if sealed() == before {
+		t.Error("values not re-sealed")
+	}
+	// The store moved to the new key; so does a fresh start with it, and
+	// the values are what they were.
+	for _, k := range [][]byte{nil, newKey} {
+		if k != nil {
+			s.SetKey(k)
+		}
+		ps, err := s.Secrets(ctx, p)
+		qs, err2 := s.Secrets(ctx, q)
+		if err != nil || err2 != nil || len(ps) != 2 || string(ps[0].Value) != "key one\n" || string(ps[1].Value) != "tok-1" || string(qs[0].Value) != "tok-2" {
+			t.Errorf("after rotation: %+v %+v %v %v", ps, qs, err, err2)
+		}
+	}
+	s.SetKey(oldKey)
+	if _, err := s.CheckKey(ctx); err == nil {
+		t.Error("the old key still opens the credentials")
+	}
+
+	log, _ := s.AuditLog(ctx, AuditFilter{}, 10, 0)
+	if len(log) != 1 || log[0].Action != "credentials key rotated" || log[0].Detail != "3 credentials" {
+		t.Errorf("audit: %+v", log)
+	}
+}

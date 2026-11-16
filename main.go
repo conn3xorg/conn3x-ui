@@ -32,8 +32,19 @@ func main() {
 		fmt.Println("conn3x-ui", version)
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "rotate-key" {
+		fs := flag.NewFlagSet("rotate-key", flag.ExitOnError)
+		data := fs.String("data", "data", "directory with the database")
+		oldFile := fs.String("old-key-file", "", "file with the key the credentials are sealed with now; or set "+keyEnv)
+		newFile := fs.String("new-key-file", "", "file with the key to seal them with from now on; or set "+newKeyEnv)
+		fs.Parse(os.Args[2:])
+		if err := rotateKey(*data, *oldFile, *newFile); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui version")
+		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -53,15 +64,19 @@ func main() {
 	}
 }
 
-// keyEnv holds the credentials key when -key-file doesn't.
-const keyEnv = "CONN3X_UI_KEY"
+// keyEnv holds the credentials key when -key-file doesn't, and newKeyEnv
+// the one rotate-key moves to when -new-key-file doesn't.
+const (
+	keyEnv    = "CONN3X_UI_KEY"
+	newKeyEnv = "CONN3X_UI_NEW_KEY"
+)
 
-// loadKey reads the credentials key from file, or from keyEnv when file is
-// empty, and takes keyEnv out of the environment so no run inherits it. No
+// loadKey reads the credentials key from file, or from env when file is
+// empty, and takes env out of the environment so no run inherits it. No
 // key at all is nil: the UI runs without credentials.
-func loadKey(file string) ([]byte, error) {
-	b64 := os.Getenv(keyEnv)
-	os.Unsetenv(keyEnv)
+func loadKey(file, env string) ([]byte, error) {
+	b64 := os.Getenv(env)
+	os.Unsetenv(env)
 	if file != "" {
 		b, err := os.ReadFile(file)
 		if err != nil {
@@ -113,8 +128,42 @@ func setupOIDC(ctx context.Context, oc oidcConfig) (*web.OIDC, error) {
 	return web.NewOIDC(ctx, oc.issuer, oc.clientID, strings.TrimSpace(secret), oc.redirectURL, oc.emailDomain)
 }
 
+// rotateKey re-seals every credential in data's database under the new
+// key. Run it with the UI stopped: one still running has the old key.
+func rotateKey(data, oldFile, newFile string) error {
+	oldKey, err := loadKey(oldFile, keyEnv)
+	if err != nil {
+		return err
+	}
+	newKey, err := loadKey(newFile, newKeyEnv)
+	if err != nil {
+		return err
+	}
+	if oldKey == nil || newKey == nil {
+		return errors.New("rotate-key needs the old key, from -old-key-file or " + keyEnv + ", and the new one, from -new-key-file or " + newKeyEnv)
+	}
+	path := filepath.Join(data, "conn3x-ui.db")
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.SetKey(oldKey); err != nil {
+		return err
+	}
+	n, err := st.RotateKey(context.Background(), newKey)
+	if err != nil {
+		return err
+	}
+	log.Printf("re-sealed %d credentials under the new key. Start the UI with it from now on", n)
+	return nil
+}
+
 func serve(listen, data, keyFile string, oc oidcConfig) error {
-	key, err := loadKey(keyFile)
+	key, err := loadKey(keyFile, keyEnv)
 	if err != nil {
 		return err
 	}
@@ -126,13 +175,22 @@ func serve(listen, data, keyFile string, oc oidcConfig) error {
 		return err
 	}
 	defer st.Close()
-	if key == nil {
-		log.Printf("no credentials key, so credentials are off. Make one with openssl rand -base64 32 > key, then start with -key-file key or set %s", keyEnv)
-	} else if err := st.SetKey(key); err != nil {
-		return err
+	if key != nil {
+		if err := st.SetKey(key); err != nil {
+			return err
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	saved, err := st.CheckKey(ctx)
+	if err != nil {
+		return err
+	}
+	if key == nil && saved > 0 {
+		log.Printf("no credentials key, but %d credentials are saved: runs of their projects will fail until the UI starts with the key they were saved with, from -key-file or %s", saved, keyEnv)
+	} else if key == nil {
+		log.Printf("no credentials key, so credentials are off. Make one with openssl rand -base64 32 > key, then start with -key-file key or set %s", keyEnv)
+	}
 	if n, err := st.UserCount(ctx); err != nil {
 		return err
 	} else if n == 0 {
@@ -158,6 +216,11 @@ func serve(listen, data, keyFile string, oc oidcConfig) error {
 		}
 	}
 	runner := run.New(ctx, st, data)
+	if n, err := runner.RemoveLeftovers(); err != nil {
+		return err
+	} else if n > 0 {
+		log.Printf("removed %d credentials directories left by runs that stopped with the UI", n)
+	}
 	scheduled := make(chan struct{})
 	go func() { runner.Schedule(ctx); close(scheduled) }()
 	h := web.New(st, runner)

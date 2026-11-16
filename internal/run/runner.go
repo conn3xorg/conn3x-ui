@@ -208,7 +208,7 @@ func (r *Runner) credentials(id int64, p store.Project) (env []string, cleanup f
 	r.mu.Lock()
 	r.hide[id] = hider(secrets)
 	r.mu.Unlock()
-	dir, env, err := writeCredentials(secrets)
+	dir, env, err := writeCredentials(r.credentialsDir(), secrets)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -231,11 +231,50 @@ func ValidateCredentialName(name string) error {
 // CONN3X_CRED_SSH_KEY.
 func CredentialEnv(name string) string { return "CONN3X_CRED_" + strings.ToUpper(name) }
 
-// writeCredentials writes each file credential into a fresh directory only
-// this user can read, and returns the directory and the environment: NAME=value
-// for an env credential, CredentialEnv(NAME)=path for a file one.
-func writeCredentials(secrets []store.Secret) (dir string, env []string, err error) {
-	dir, err = os.MkdirTemp("", "conn3x-ui-cred-") // 0700
+// credPrefix starts the name of each run's credentials directory.
+const credPrefix = "conn3x-ui-cred-"
+
+// credentialsDir is the one parent of every run's credentials directory,
+// so a start can find what a crash left behind.
+func (r *Runner) credentialsDir() string { return filepath.Join(r.DataDir, "credentials") }
+
+// RemoveLeftovers removes the credentials directories that runs which died
+// with conn3x-ui left behind, and returns how many. Call it at start,
+// before any run. It removes nothing but credPrefix directories in
+// credentialsDir.
+func (r *Runner) RemoveLeftovers() (int, error) {
+	entries, err := os.ReadDir(r.credentialsDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), credPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(r.credentialsDir(), e.Name())); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
+// writeCredentials writes each file credential into a fresh directory in
+// parent that only this user can read, and returns the directory and the
+// environment: NAME=value for an env credential, CredentialEnv(NAME)=path
+// for a file one.
+func writeCredentials(parent string, secrets []store.Secret) (dir string, env []string, err error) {
+	// Absolute, as conn3x runs in the checkout.
+	if parent, err = filepath.Abs(parent); err != nil {
+		return "", nil, err
+	}
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", nil, err
+	}
+	dir, err = os.MkdirTemp(parent, credPrefix) // 0700
 	if err != nil {
 		return "", nil, err
 	}

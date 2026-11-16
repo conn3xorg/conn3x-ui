@@ -680,16 +680,110 @@ func (s *Store) Secrets(ctx context.Context, projectID int64) ([]Secret, error) 
 		if s.aead == nil {
 			return nil, ErrNoKey
 		}
-		n := s.aead.NonceSize()
-		if len(sealed) < n {
+		if len(sealed) < s.aead.NonceSize() {
 			return nil, fmt.Errorf("credential %s is damaged", c.Name)
 		}
-		if c.Value, err = s.aead.Open(nil, sealed[:n], sealed[n:], credAD(projectID, c.Name)); err != nil {
+		if c.Value, err = s.open(projectID, c.Name, sealed); err != nil {
 			return nil, fmt.Errorf("credential %s won't open: conn3x-ui was started with a different key from the one it was saved with, or the row was changed", c.Name)
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// errWrongKey is a sealed value the key doesn't open.
+const errWrongKey = "isn't the key the credentials were saved with. Start with that key, or rotate to a new one with conn3x-ui rotate-key"
+
+// CheckKey opens one saved credential, so a wrong key stops conn3x-ui at
+// start rather than at the first run that needs it. It returns how many
+// credentials are saved; with none, or no key, there's nothing to open.
+func (s *Store) CheckKey(ctx context.Context) (int, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM credentials").Scan(&n); err != nil || n == 0 || s.aead == nil {
+		return n, err
+	}
+	var projectID int64
+	var name string
+	var sealed []byte
+	if err := s.db.QueryRowContext(ctx, "SELECT project_id, name, value FROM credentials LIMIT 1").Scan(&projectID, &name, &sealed); err != nil {
+		return n, err
+	}
+	plain, err := s.open(projectID, name, sealed)
+	if err != nil {
+		return n, errors.New("the credentials key " + errWrongKey)
+	}
+	clear(plain)
+	return n, nil
+}
+
+// open opens a credential's sealed value with the store's key.
+func (s *Store) open(projectID int64, name string, sealed []byte) ([]byte, error) {
+	n := s.aead.NonceSize()
+	if len(sealed) < n {
+		return nil, errors.New("damaged")
+	}
+	return s.aead.Open(nil, sealed[:n], sealed[n:], credAD(projectID, name))
+}
+
+// RotateKey re-seals every credential under newKey in one transaction, and
+// records it in the audit log by count. If the store's key doesn't open
+// every one, nothing changes. From then on the store uses newKey.
+func (s *Store) RotateKey(ctx context.Context, newKey []byte) (int, error) {
+	if s.aead == nil {
+		return 0, ErrNoKey
+	}
+	next := &Store{}
+	if err := next.SetKey(newKey); err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	type row struct {
+		projectID int64
+		name      string
+		sealed    []byte
+	}
+	var all []row
+	rows, err := tx.QueryContext(ctx, "SELECT project_id, name, value FROM credentials")
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.projectID, &r.name, &r.sealed); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, r := range all {
+		plain, err := s.open(r.projectID, r.name, r.sealed)
+		if err != nil {
+			return 0, fmt.Errorf("credential %s won't open: the old key %s", r.name, errWrongKey)
+		}
+		nonce := make([]byte, next.aead.NonceSize())
+		rand.Read(nonce)
+		sealed := next.aead.Seal(nonce, nonce, plain, credAD(r.projectID, r.name))
+		clear(plain)
+		if _, err := tx.ExecContext(ctx, "UPDATE credentials SET value=? WHERE project_id=? AND name=?", sealed, r.projectID, r.name); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, auditInsert, now(), 0, "", 0, "", "credentials key rotated", fmt.Sprintf("%d credentials", len(all))); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.aead = next.aead
+	return len(all), nil
 }
 
 // User is someone who can sign in.
@@ -1002,9 +1096,11 @@ type Entry struct {
 	Detail      string
 }
 
+const auditInsert = "INSERT INTO audit (at, user_id, user_name, project_id, project_name, action, detail) VALUES (?, NULLIF(?, 0), ?, NULLIF(?, 0), ?, ?, ?)"
+
 // Audit appends e to the audit log, at now.
 func (s *Store) Audit(ctx context.Context, e Entry) error {
-	_, err := s.db.ExecContext(ctx, "INSERT INTO audit (at, user_id, user_name, project_id, project_name, action, detail) VALUES (?, NULLIF(?, 0), ?, NULLIF(?, 0), ?, ?, ?)",
+	_, err := s.db.ExecContext(ctx, auditInsert,
 		now(), e.UserID, e.UserName, e.ProjectID, e.ProjectName, e.Action, e.Detail)
 	return err
 }
