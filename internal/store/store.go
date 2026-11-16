@@ -1,8 +1,8 @@
 // Copyright (c) The Conn3x Authors
 // SPDX-License-Identifier: MPL-2.0
 
-// Package store keeps projects, runs, users, sessions and credentials in
-// one SQLite file.
+// Package store keeps projects, runs, users, roles, sessions, credentials
+// and the audit log in one SQLite file.
 package store
 
 import (
@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -103,6 +104,37 @@ var migrations = []string{
 	`ALTER TABLE projects ADD COLUMN schedule TEXT NOT NULL DEFAULT '';
 	ALTER TABLE projects ADD COLUMN webhook_url TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN outcome TEXT NOT NULL DEFAULT '';`,
+	// 6: site admins, disabled users, a role per user per project, the
+	// setting that lets planners apply their own plans, and the audit log.
+	// Until now the only user was the admin made at first start, so every
+	// existing user stays an admin. The audit log keeps names as text and
+	// has no foreign keys, so deleting a project or user never touches it,
+	// and its triggers refuse any UPDATE or DELETE.
+	`ALTER TABLE users ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
+	UPDATE users SET admin = 1;
+	ALTER TABLE projects ADD COLUMN self_apply INTEGER NOT NULL DEFAULT 0;
+	CREATE TABLE roles (
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		role TEXT NOT NULL,
+		PRIMARY KEY (project_id, user_id)
+	);
+	CREATE INDEX roles_user ON roles(user_id);
+	CREATE TABLE audit (
+		id INTEGER PRIMARY KEY,
+		at TEXT NOT NULL,
+		user_id INTEGER,
+		user_name TEXT NOT NULL,
+		project_id INTEGER,
+		project_name TEXT NOT NULL,
+		action TEXT NOT NULL,
+		detail TEXT NOT NULL
+	);
+	CREATE INDEX audit_user ON audit(user_id, id);
+	CREATE INDEX audit_project ON audit(project_id, id);
+	CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
+	CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;`,
 }
 
 // Store is the database.
@@ -177,8 +209,10 @@ type Project struct {
 	// WebhookURL gets a POST when a drift check finds drift or fails. It
 	// may hold a token, so pages show only its host.
 	WebhookURL string
-	CreatedAt  string
-	UpdatedAt  string
+	// SelfApply lets a planner apply a plan they made themselves.
+	SelfApply bool
+	CreatedAt string
+	UpdatedAt string
 }
 
 // WebhookHost is the webhook URL's host, all a page shows of it.
@@ -200,11 +234,11 @@ func (p Project) EnvList() []string {
 	return out
 }
 
-const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, created_at, updated_at"
+const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, self_apply, created_at, updated_at"
 
 func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 	var p Project
-	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.SelfApply, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -214,8 +248,8 @@ func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 // CreateProject adds p and returns its ID.
 func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 	t := now()
-	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, t, t)
+	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, t, t)
 	if err != nil {
 		return 0, err
 	}
@@ -224,8 +258,8 @@ func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 
 // UpdateProject saves p's fields over the project with p.ID.
 func (s *Store) UpdateProject(ctx context.Context, p Project) error {
-	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, updated_at=? WHERE id=?",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, now(), p.ID)
+	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, self_apply=?, updated_at=? WHERE id=?",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, now(), p.ID)
 	if err != nil {
 		return err
 	}
@@ -254,7 +288,16 @@ func (s *Store) Project(ctx context.Context, id int64) (Project, error) {
 
 // Projects returns every project, by name.
 func (s *Store) Projects(ctx context.Context) ([]Project, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+projectCols+" FROM projects ORDER BY name")
+	return s.projects(ctx, "SELECT "+projectCols+" FROM projects ORDER BY name")
+}
+
+// MemberProjects returns the projects userID has a role on, by name.
+func (s *Store) MemberProjects(ctx context.Context, userID int64) ([]Project, error) {
+	return s.projects(ctx, "SELECT "+projectCols+" FROM projects WHERE id IN (SELECT project_id FROM roles WHERE user_id=?) ORDER BY name", userID)
+}
+
+func (s *Store) projects(ctx context.Context, query string, args ...any) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -462,11 +505,13 @@ func (s *Store) SetRunHosts(ctx context.Context, id int64, outcomes map[string]s
 }
 
 // Filter narrows History. A zero field matches every run. Status matches
-// a run's status or its drift check outcome.
+// a run's status or its drift check outcome. UserID keeps to the projects
+// that user has a role on.
 type Filter struct {
 	ProjectID int64
 	Host      string
 	Status    string
+	UserID    int64
 }
 
 // History returns runs across projects that match f, newest first,
@@ -475,7 +520,8 @@ type Filter struct {
 func (s *Store) History(ctx context.Context, f Filter, limit, offset int) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT "+runCols+", COALESCE((SELECT outcome FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3), '') FROM runs "+
 		"WHERE (?1 = 0 OR project_id = ?1) AND (?2 = '' OR status = ?2 OR outcome = ?2) AND (?3 = '' OR EXISTS (SELECT 1 FROM run_hosts h WHERE h.run_id = runs.id AND h.host = ?3)) "+
-		"ORDER BY id DESC LIMIT ?4 OFFSET ?5", f.ProjectID, f.Status, f.Host, limit, offset)
+		"AND (?6 = 0 OR project_id IN (SELECT project_id FROM roles WHERE user_id = ?6)) "+
+		"ORDER BY id DESC LIMIT ?4 OFFSET ?5", f.ProjectID, f.Status, f.Host, limit, offset, f.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -642,11 +688,27 @@ func (s *Store) Secrets(ctx context.Context, projectID int64) ([]Secret, error) 
 }
 
 // User is someone who can sign in.
-// shortcut: local accounts only, one admin made at first start; #892 brings
-// OIDC and roles.
+// shortcut: local accounts only; OIDC sign-in and groups are the rest of
+// #892.
 type User struct {
 	ID   int64
 	Name string
+	// Admin manages users, reads the audit log, and is admin on every
+	// project.
+	Admin bool
+	// Disabled can't sign in.
+	Disabled bool
+}
+
+const userCols = "id, name, admin, disabled"
+
+func scanUser(row interface{ Scan(...any) error }) (User, error) {
+	var u User
+	err := row.Scan(&u.ID, &u.Name, &u.Admin, &u.Disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrNotFound
+	}
+	return u, err
 }
 
 // Token returns n random bytes as hex.
@@ -666,7 +728,14 @@ func hashPassword(password, salt string) string {
 	return "pbkdf2-sha256$" + salt + "$" + hex.EncodeToString(key)
 }
 
-// CreateUser adds a user with a password.
+// matches says whether password is the one hash was made from.
+func matches(hash, password string) bool {
+	parts := strings.Split(hash, "$")
+	return len(parts) == 3 && hmac.Equal([]byte(hashPassword(password, parts[1])), []byte(hash))
+}
+
+// CreateUser adds a user with a password. They aren't an admin and have no
+// role on any project until given one.
 func (s *Store) CreateUser(ctx context.Context, name, password string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, "INSERT INTO users (name, password_hash, created_at) VALUES (?, ?, ?)",
 		name, hashPassword(password, Token(16)), now())
@@ -676,6 +745,78 @@ func (s *Store) CreateUser(ctx context.Context, name, password string) (int64, e
 	return res.LastInsertId()
 }
 
+// SetUser makes a user an admin or not, and disabled or not. Disabling
+// ends their sessions.
+func (s *Store) SetUser(ctx context.Context, id int64, admin, disabled bool) error {
+	res, err := s.db.ExecContext(ctx, "UPDATE users SET admin=?, disabled=? WHERE id=?", admin, disabled, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	if disabled {
+		_, err = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id=?", id)
+	}
+	return err
+}
+
+// SetPassword replaces a user's password and ends their sessions, all but
+// the one with token keep.
+func (s *Store) SetPassword(ctx context.Context, id int64, password, keep string) error {
+	res, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash=? WHERE id=?", hashPassword(password, Token(16)), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	_, err = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id=? AND token<>?", id, keep)
+	return err
+}
+
+// CheckPassword is ErrNotFound unless password is the user's.
+func (s *Store) CheckPassword(ctx context.Context, id int64, password string) error {
+	var hash string
+	if err := s.db.QueryRowContext(ctx, "SELECT password_hash FROM users WHERE id=?", id).Scan(&hash); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if !matches(hash, password) {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// User returns one user.
+func (s *Store) User(ctx context.Context, id int64) (User, error) {
+	return scanUser(s.db.QueryRowContext(ctx, "SELECT "+userCols+" FROM users WHERE id=?", id))
+}
+
+// UserNamed returns the user with that name.
+func (s *Store) UserNamed(ctx context.Context, name string) (User, error) {
+	return scanUser(s.db.QueryRowContext(ctx, "SELECT "+userCols+" FROM users WHERE name=?", name))
+}
+
+// Users returns every user, by name.
+func (s *Store) Users(ctx context.Context) ([]User, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT "+userCols+" FROM users ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // UserCount says how many users exist, so the first start can make one.
 func (s *Store) UserCount(ctx context.Context) (int, error) {
 	var n int
@@ -683,12 +824,14 @@ func (s *Store) UserCount(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// Login checks a password and, when it's right, opens a session. It
-// returns the session token and its CSRF token.
+// Login checks a password and, when it's right and the user isn't
+// disabled, opens a session. It returns the session token and its CSRF
+// token.
 func (s *Store) Login(ctx context.Context, name, password string, ttl time.Duration) (token, csrf string, err error) {
 	var id int64
 	var hash string
-	err = s.db.QueryRowContext(ctx, "SELECT id, password_hash FROM users WHERE name=?", name).Scan(&id, &hash)
+	var disabled bool
+	err = s.db.QueryRowContext(ctx, "SELECT id, password_hash, disabled FROM users WHERE name=?", name).Scan(&id, &hash, &disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Hash anyway, so a missing user takes as long as a wrong password.
 		hashPassword(password, "x")
@@ -697,8 +840,7 @@ func (s *Store) Login(ctx context.Context, name, password string, ttl time.Durat
 	if err != nil {
 		return "", "", err
 	}
-	parts := strings.Split(hash, "$")
-	if len(parts) != 3 || !hmac.Equal([]byte(hashPassword(password, parts[1])), []byte(hash)) {
+	if !matches(hash, password) || disabled {
 		return "", "", ErrNotFound
 	}
 	token, csrf = Token(32), Token(32)
@@ -707,12 +849,13 @@ func (s *Store) Login(ctx context.Context, name, password string, ttl time.Durat
 	return token, csrf, err
 }
 
-// Session returns the user and CSRF token of a live session.
+// Session returns the user and CSRF token of a live session of a user who
+// isn't disabled.
 func (s *Store) Session(ctx context.Context, token string) (User, string, error) {
 	var u User
 	var csrf string
-	err := s.db.QueryRowContext(ctx, "SELECT u.id, u.name, s.csrf FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=? AND s.expires_at > ?",
-		token, now()).Scan(&u.ID, &u.Name, &csrf)
+	err := s.db.QueryRowContext(ctx, "SELECT u.id, u.name, u.admin, u.disabled, s.csrf FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=? AND s.expires_at > ? AND u.disabled = 0",
+		token, now()).Scan(&u.ID, &u.Name, &u.Admin, &u.Disabled, &csrf)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -723,4 +866,124 @@ func (s *Store) Session(ctx context.Context, token string) (User, string, error)
 func (s *Store) Logout(ctx context.Context, token string) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE token=?", token)
 	return err
+}
+
+// Roles on a project, each allowed what the ones before it are: a viewer
+// sees runs and history, a planner starts plans, an approver applies a
+// plan someone else made, and an admin edits the project, its credentials
+// and its roles.
+const (
+	RoleViewer   = "viewer"
+	RolePlanner  = "planner"
+	RoleApprover = "approver"
+	RoleAdmin    = "admin"
+)
+
+// Roles is every role, least first.
+var Roles = []string{RoleViewer, RolePlanner, RoleApprover, RoleAdmin}
+
+// RoleAtLeast says whether have allows what want does. No role, or one
+// that isn't in Roles, allows nothing.
+func RoleAtLeast(have, want string) bool {
+	h := slices.Index(Roles, have)
+	return h >= 0 && h >= slices.Index(Roles, want)
+}
+
+// Member is a user's role on a project.
+type Member struct {
+	UserID int64
+	Name   string
+	Role   string
+}
+
+// Role returns a user's role on a project, "" for none.
+func (s *Store) Role(ctx context.Context, projectID, userID int64) (string, error) {
+	var role string
+	err := s.db.QueryRowContext(ctx, "SELECT role FROM roles WHERE project_id=? AND user_id=?", projectID, userID).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return role, err
+}
+
+// SetRole gives a user a role on a project, replacing the one they had.
+// Role "" takes it away.
+func (s *Store) SetRole(ctx context.Context, projectID, userID int64, role string) error {
+	if role == "" {
+		_, err := s.db.ExecContext(ctx, "DELETE FROM roles WHERE project_id=? AND user_id=?", projectID, userID)
+		return err
+	}
+	if !slices.Contains(Roles, role) {
+		return fmt.Errorf("%q isn't a role; a role is one of %s", role, strings.Join(Roles, ", "))
+	}
+	_, err := s.db.ExecContext(ctx, "INSERT INTO roles (project_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (project_id, user_id) DO UPDATE SET role=excluded.role",
+		projectID, userID, role)
+	return err
+}
+
+// Members returns who has a role on a project, by name.
+func (s *Store) Members(ctx context.Context, projectID int64) ([]Member, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT u.id, u.name, r.role FROM roles r JOIN users u ON u.id = r.user_id WHERE r.project_id=? ORDER BY u.name", projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Member
+	for rows.Next() {
+		var m Member
+		if err := rows.Scan(&m.UserID, &m.Name, &m.Role); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// Entry is one line of the audit log. It copies the user's and project's
+// names, so it still reads right once either is gone. It never holds a
+// password or a credential's value.
+type Entry struct {
+	ID int64
+	At string
+	// UserID is 0 for a failed sign-in with a name nobody has.
+	UserID   int64
+	UserName string
+	// ProjectID is 0 for an action that isn't on a project.
+	ProjectID   int64
+	ProjectName string
+	Action      string
+	Detail      string
+}
+
+// Audit appends e to the audit log, at now.
+func (s *Store) Audit(ctx context.Context, e Entry) error {
+	_, err := s.db.ExecContext(ctx, "INSERT INTO audit (at, user_id, user_name, project_id, project_name, action, detail) VALUES (?, NULLIF(?, 0), ?, NULLIF(?, 0), ?, ?, ?)",
+		now(), e.UserID, e.UserName, e.ProjectID, e.ProjectName, e.Action, e.Detail)
+	return err
+}
+
+// AuditFilter narrows AuditLog. A zero field matches every entry.
+type AuditFilter struct {
+	UserID    int64
+	ProjectID int64
+}
+
+// AuditLog returns the entries that match f, newest first, skipping the
+// first offset and returning at most limit.
+func (s *Store) AuditLog(ctx context.Context, f AuditFilter, limit, offset int) ([]Entry, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, at, COALESCE(user_id, 0), user_name, COALESCE(project_id, 0), project_name, action, detail FROM audit "+
+		"WHERE (?1 = 0 OR user_id = ?1) AND (?2 = 0 OR project_id = ?2) ORDER BY id DESC LIMIT ?3 OFFSET ?4", f.UserID, f.ProjectID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.At, &e.UserID, &e.UserName, &e.ProjectID, &e.ProjectName, &e.Action, &e.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }

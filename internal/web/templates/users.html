@@ -1,0 +1,38 @@
+{{define "title"}}Users{{end}}
+{{define "content"}}
+<h1>Users</h1>
+{{with .Data.Shown}}<p class="shown">The password for {{.Name}} is <code>{{.Password}}</code>. Pass it on now: it isn't shown again.</p>{{end}}
+<div class="cols">
+<section>
+  <table>
+    <tr><th>Name</th><th>Access</th><th>Password</th></tr>
+    {{range .Data.Users}}
+    <tr><td>{{.Name}}{{if .Disabled}} <small>disabled</small>{{end}}</td>
+      <td><form method="post" action="/users/{{.ID}}">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <label><input type="checkbox" name="admin" value="1" style="width:auto"{{if .Admin}} checked{{end}}> Site admin</label>
+        <label><input type="checkbox" name="disabled" value="1" style="width:auto"{{if .Disabled}} checked{{end}}> Disabled</label>
+        <button>Save</button></form></td>
+      <td><form method="post" action="/users/{{.ID}}/password" onsubmit="return confirm('Reset the password for {{.Name}}? Their sessions are signed out.')">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input name="password" type="password" autocomplete="new-password" placeholder="blank for a generated one" aria-label="New password for {{.Name}}">
+        <button>Reset</button></form></td></tr>
+    {{end}}
+  </table>
+  <p><small>A site admin manages users, reads the audit log, and is admin on every project. Everyone else sees only the projects they have a role on.</small></p>
+</section>
+<section>
+  <h2>New user</h2>
+  <form method="post" action="/users">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="name">Name</label>
+    <input id="name" name="name" autocomplete="off" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="new-password">
+    <small>At least 12 characters, or blank for a generated one, shown once.</small>
+    <label><input type="checkbox" name="admin" value="1" style="width:auto"> Site admin</label>
+    <p><button class="primary">Create user</button></p>
+  </form>
+</section>
+</div>
+{{end}}

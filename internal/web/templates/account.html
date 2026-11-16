@@ -1,0 +1,15 @@
+{{define "title"}}Account{{end}}
+{{define "content"}}
+<h1>{{.User.Name}}</h1>
+{{with .Data}}<p class="shown">{{.}}</p>{{end}}
+<h2>Change your password</h2>
+<form method="post" action="/account/password" style="max-width: 24rem">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label for="current">Current password</label>
+  <input id="current" name="current" type="password" autocomplete="current-password" required>
+  <label for="password">New password</label>
+  <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+  <small>At least 12 characters. Your other sessions are signed out.</small>
+  <p><button class="primary">Change password</button></p>
+</form>
+{{end}}

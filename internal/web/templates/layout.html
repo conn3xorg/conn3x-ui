@@ -19,6 +19,7 @@
   button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
   button.danger { background: transparent; color: var(--bad); }
   table { border-collapse: collapse; width: 100%; } th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .shown { border: 1px solid var(--ok); padding: .5rem .75rem; border-radius: 4px; }
   .error { color: var(--bad); border: 1px solid var(--bad); padding: .5rem .75rem; border-radius: 4px; white-space: pre-wrap; }
   .status { font-weight: 600; } .succeeded { color: var(--ok); } .failed { color: var(--bad); } .running, .queued { color: var(--warn); } .cancelled, .clean { color: var(--muted); } .drift { color: var(--bad); }
   pre { background: #111; color: #e5e7eb; padding: .75rem; border-radius: 4px; overflow: auto; max-height: 28rem; font-size: 13px; white-space: pre-wrap; }
@@ -29,8 +30,8 @@
 </head>
 <body>
 <header>
-  <span><a href="/">Conn3x</a>{{if .User.Name}} &nbsp; <a href="/runs">Runs</a>{{end}}</span>
-  {{if .User.Name}}<span><small>{{.User.Name}}</small>
+  <span><a href="/">Conn3x</a>{{if .User.Name}} &nbsp; <a href="/runs">Runs</a>{{if .User.Admin}} &nbsp; <a href="/users">Users</a> &nbsp; <a href="/audit">Audit</a>{{end}}{{end}}</span>
+  {{if .User.Name}}<span><a href="/account"><small>{{.User.Name}}</small></a>
     <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Sign out</button></form></span>{{end}}
 </header>
 <main>

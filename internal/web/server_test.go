@@ -247,9 +247,15 @@ func (c *client) post(path string, form url.Values) *http.Response {
 }
 
 func (c *client) login(t *testing.T) {
+	t.Helper()
+	c.loginAs(t, "admin", "pw")
+}
+
+func (c *client) loginAs(t *testing.T, name, password string) {
+	t.Helper()
 	csrf := c.csrf("/login")
-	if resp := c.post("/login", url.Values{"csrf": {csrf}, "name": {"admin"}, "password": {"pw"}}); resp.StatusCode != 303 || resp.Header.Get("Location") != "/" {
-		t.Fatalf("login: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	if resp := c.post("/login", url.Values{"csrf": {csrf}, "name": {name}, "password": {password}}); resp.StatusCode != 303 || resp.Header.Get("Location") != "/" {
+		t.Fatalf("login as %s: %d %s", name, resp.StatusCode, resp.Header.Get("Location"))
 	}
 }
 
@@ -339,7 +345,7 @@ func setup(t *testing.T) env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	if _, err := st.CreateUser(context.Background(), "admin", "pw"); err != nil {
+	if id, err := st.CreateUser(context.Background(), "admin", "pw"); err != nil || st.SetUser(context.Background(), id, true, false) != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -570,6 +576,9 @@ func TestCancel(t *testing.T) {
 	}
 	if resp := e.post(runPath+"/cancel", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
 		t.Errorf("cancel of a finished run: %d", resp.StatusCode)
+	}
+	if got := auditLines(t, e.st); !slices.Contains(got, "admin web cancel run 1") {
+		t.Errorf("audit log lacks the cancel:\n%s", strings.Join(got, "\n"))
 	}
 }
 

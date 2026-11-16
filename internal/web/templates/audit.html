@@ -1,0 +1,24 @@
+{{define "title"}}Audit log{{end}}
+{{define "content"}}
+<h1>Audit log</h1>
+<form method="get" action="/audit" style="display:flex; gap:.75rem; align-items:end; flex-wrap:wrap">
+  <span><label for="user">User</label>
+  <select id="user" name="user"><option value="">Any</option>
+    {{range .Data.Users}}<option value="{{.ID}}"{{if eq .ID $.Data.Filter.UserID}} selected{{end}}>{{.Name}}</option>{{end}}
+  </select></span>
+  <span><label for="project">Project</label>
+  <select id="project" name="project"><option value="">Any</option>
+    {{range .Data.Projects}}<option value="{{.ID}}"{{if eq .ID $.Data.Filter.ProjectID}} selected{{end}}>{{.Name}}</option>{{end}}
+  </select></span>
+  <button>Filter</button>
+</form>
+{{if .Data.Entries}}
+<table>
+  <tr><th>When</th><th>User</th><th>Project</th><th>Action</th><th>Detail</th></tr>
+  {{range .Data.Entries}}
+  <tr><td>{{.At}}</td><td>{{if .UserName}}{{.UserName}}{{else}}<small>unknown</small>{{end}}</td><td>{{.ProjectName}}</td><td>{{.Action}}</td><td>{{.Detail}}</td></tr>
+  {{end}}
+</table>
+{{else}}<p>Nothing matches.</p>{{end}}
+<p>{{with .Data.Prev}}<a href="{{.}}">Newer</a>{{end}} {{with .Data.Next}}<a href="{{.}}">Older</a>{{end}}</p>
+{{end}}

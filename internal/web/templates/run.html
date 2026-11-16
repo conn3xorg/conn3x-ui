@@ -26,7 +26,7 @@
     {{if .Data.Run.FinishedAt.Valid}} · finished {{.Data.Run.FinishedAt.String}}{{end}}
   </p>
   {{if .Data.Run.PlanRunID.Valid}}<p>Applies <a href="/runs/{{.Data.Run.PlanRunID.Int64}}">plan {{.Data.Run.PlanRunID.Int64}}</a>{{if .Data.Run.ApprovedAt.Valid}}, approved by {{if .Data.Run.ApprovedByName.Valid}}{{.Data.Run.ApprovedByName.String}}{{else}}a removed user{{end}} at {{.Data.Run.ApprovedAt.String}}{{end}}.</p>{{end}}
-  {{if not .Data.Run.Finished}}
+  {{if .Data.CanCancel}}
   <form method="post" action="/runs/{{.Data.Run.ID}}/cancel" style="display:inline">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <button class="danger">Cancel</button>
