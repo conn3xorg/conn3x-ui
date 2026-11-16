@@ -44,6 +44,8 @@ cosign verify ghcr.io/conn3xorg/conn3x-ui:vX.Y.Z \
 
 Each release also has SBOMs and a build provenance attestation: `gh attestation verify conn3x-ui_VERSION_linux_amd64.tar.gz --repo conn3xorg/conn3x-ui`.
 
+`./conn3x-ui version` prints the release you have.
+
 ## Run it
 
 To build it yourself, you need Go 1.27, `git` on PATH, and a `conn3x` binary.
