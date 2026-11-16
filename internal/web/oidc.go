@@ -239,16 +239,25 @@ func (s *Server) createOIDCUser(r *http.Request, o *OIDC, subject, username, ema
 	return u, err
 }
 
-// CheckPasswordOff is nil when password sign-in may be turned off: OIDC is
-// set up, and a site admin who isn't disabled signs in with it. Otherwise
-// nobody could sign in to make one.
-func CheckPasswordOff(ctx context.Context, st *store.Store, o *OIDC) error {
+// TurnPasswordOff readies the UI to start with password sign-in off. It
+// refuses unless OIDC is set up and a site admin who isn't disabled signs
+// in with it, since otherwise nobody could sign in to make one. Then it
+// ends every session of a user with no OIDC link: those were opened with
+// a password.
+func TurnPasswordOff(ctx context.Context, st *store.Store, o *OIDC) error {
 	if o == nil {
 		return errors.New("password sign-in can only be turned off with OIDC set up")
 	}
 	n, err := st.OIDCAdmins(ctx, o.Issuer)
 	if err == nil && n == 0 {
 		err = errors.New("password sign-in stays on until a site admin signs in with OIDC: sign in with OIDC once, make that user a site admin under Users, then restart with password sign-in off")
+	}
+	if err != nil {
+		return err
+	}
+	ended, err := st.EndPasswordSessions(ctx)
+	if err == nil && ended > 0 {
+		err = st.Audit(ctx, store.Entry{Action: "password sessions ended", Detail: fmt.Sprintf("%d, as password sign-in is off", ended)})
 	}
 	return err
 }

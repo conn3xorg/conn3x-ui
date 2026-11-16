@@ -16,7 +16,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -290,48 +289,45 @@ func TestPasswordOff(t *testing.T) {
 
 	// Turning password sign-in off needs a site admin who signs in with
 	// OIDC, so nobody is locked out.
-	if CheckPasswordOff(ctx, e.st, nil) == nil {
+	if TurnPasswordOff(ctx, e.st, nil) == nil {
 		t.Error("password sign-in off without OIDC")
 	}
-	if CheckPasswordOff(ctx, e.st, e.srv.OIDC) == nil {
+	if TurnPasswordOff(ctx, e.st, e.srv.OIDC) == nil {
 		t.Error("password sign-in off with no OIDC admin")
 	}
-	e.fresh().signIn(t, "olive", nil)
-	olive, _ := e.st.OIDCUser(ctx, e.idp.URL, "olive")
-	e.st.SetUser(ctx, olive.ID, true, false)
-	if err := CheckPasswordOff(ctx, e.st, e.srv.OIDC); err != nil {
-		t.Errorf("password sign-in off with an OIDC admin: %v", err)
+	olive := e.fresh()
+	olive.signIn(t, "olive", nil)
+	ou, _ := e.st.OIDCUser(ctx, e.idp.URL, "olive")
+	e.st.SetUser(ctx, ou.ID, true, false)
+	e.login(t)
+	if err := TurnPasswordOff(ctx, e.st, e.srv.OIDC); err != nil {
+		t.Fatalf("password sign-in off with an OIDC admin: %v", err)
 	}
 
-	// With it off, the page has no password form and a password post is
-	// refused; OIDC still works. The admin signed in before it went off.
-	e.login(t)
-	jar := e.Jar
-	e = startUI(t, e.st, e.idp, true, "")
-	e.Jar = jar
-	if _, body := newClient(t, e.base).get("/login"); strings.Contains(body, `name="password"`) || !strings.Contains(body, "/login/oidc") {
+	// Once off, a session opened with a password is gone and one opened
+	// with OIDC isn't.
+	off := startUI(t, e.st, e.idp, true, "")
+	if resp, _ := (&client{t, off.base, e.Client}).get("/"); resp.StatusCode != 303 {
+		t.Errorf("password session after passwords went off: %d", resp.StatusCode)
+	}
+	if resp, _ := (&client{t, off.base, olive.Client}).get("/"); resp.StatusCode != 200 {
+		t.Errorf("OIDC session after passwords went off: %d", resp.StatusCode)
+	}
+	if got := strings.Join(auditLines(t, e.st), "\n"); !strings.Contains(got, "  password sessions ended 1, as password sign-in is off") {
+		t.Errorf("audit log:\n%s", got)
+	}
+
+	// The page has no password form and a password post is refused; OIDC
+	// still works.
+	if _, body := off.get("/login"); strings.Contains(body, `name="password"`) || !strings.Contains(body, "/login/oidc") {
 		t.Errorf("sign-in page with passwords off:\n%s", body)
 	}
-	c := e.fresh()
-	c.get("/login")
-	u, _ := url.Parse(c.base)
-	csrf := c.Jar.Cookies(u)[0].Value
-	if resp, body := c.postBody("/login", url.Values{"csrf": {csrf}, "name": {"admin"}, "password": {"pw"}}); resp.StatusCode != 403 || !strings.Contains(body, "password is off") {
+	u, _ := url.Parse(off.base)
+	csrf := off.Jar.Cookies(u)[0].Value
+	if resp, body := off.postBody("/login", url.Values{"csrf": {csrf}, "name": {"admin"}, "password": {"pw"}}); resp.StatusCode != 403 || !strings.Contains(body, "password is off") {
 		t.Errorf("password sign-in while off: %d %s", resp.StatusCode, body)
 	}
-	if resp, _ := e.fresh().signIn(t, "olive", nil); resp.StatusCode != 303 {
+	if resp, _ := off.fresh().signIn(t, "olive", nil); resp.StatusCode != 303 {
 		t.Errorf("OIDC sign-in while passwords are off: %d", resp.StatusCode)
-	}
-
-	// The last OIDC site admin keeps their admin, even at another admin's
-	// hand.
-	if resp := e.post("/users/"+strconv.FormatInt(olive.ID, 10), url.Values{"csrf": {e.csrf("/users")}}); resp.StatusCode != 400 {
-		t.Errorf("drop the last OIDC admin: %d", resp.StatusCode)
-	}
-	if resp := e.post("/users/"+strconv.FormatInt(olive.ID, 10), url.Values{"csrf": {e.csrf("/users")}, "admin": {"1"}, "disabled": {"1"}}); resp.StatusCode != 400 {
-		t.Errorf("disable the last OIDC admin: %d", resp.StatusCode)
-	}
-	if u, _ := e.st.User(ctx, olive.ID); !u.Admin || u.Disabled {
-		t.Errorf("olive: %+v", u)
 	}
 }

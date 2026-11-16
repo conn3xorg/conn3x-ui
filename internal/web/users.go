@@ -104,17 +104,6 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		s.usersPage(w, r, http.StatusBadRequest, nil, "You can't take away your own admin or disable yourself. Another admin can.")
 		return
 	}
-	// With password sign-in off, a site admin who signs in with OIDC is the
-	// only way in, so the last one stays.
-	if s.PasswordOff && u.OIDC && u.Admin && !u.Disabled && (!admin || disabled) {
-		if n, err := s.Store.OIDCAdmins(r.Context(), s.OIDC.Issuer); err != nil {
-			s.fail(w, err)
-			return
-		} else if n <= 1 {
-			s.usersPage(w, r, http.StatusBadRequest, nil, "Password sign-in is off, and "+u.Name+" is the last site admin who signs in with OIDC. Make someone else one first.")
-			return
-		}
-	}
 	if err := s.Store.SetUser(r.Context(), u.ID, admin, disabled); err != nil {
 		s.fail(w, err)
 		return

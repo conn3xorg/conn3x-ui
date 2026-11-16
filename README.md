@@ -215,7 +215,7 @@ The issuer is `https://login.microsoftonline.com/TENANT_ID/v2.0` and the client 
 
 ### Turning off passwords
 
-Once single sign-on works, you can turn off password sign-in with `-no-password-sign-in`. It won't lock you out: the UI refuses to start with it until a site admin who isn't disabled signs in with OIDC. So sign in with OIDC once, make that user a site admin under **Users** while signed in as `admin`, then restart with the flag. While it's on, the last such admin can't lose their admin or be disabled.
+Once single sign-on works, you can turn off password sign-in with `-no-password-sign-in`. It won't lock you out: the UI refuses to start with it until a site admin who isn't disabled signs in with OIDC. So sign in with OIDC once, make that user a site admin under **Users** while signed in as `admin`, then restart with the flag. Starting with it signs out every session that was opened with a password, and the audit log says how many. From then on every admin signs in with OIDC, and nobody can drop their own admin, so one is always left.
 
 ## Audit log
 

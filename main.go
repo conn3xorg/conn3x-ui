@@ -153,7 +153,7 @@ func serve(listen, data, keyFile string, oc oidcConfig) error {
 		return err
 	}
 	if oc.noPassword {
-		if err := web.CheckPasswordOff(ctx, st, o); err != nil {
+		if err := web.TurnPasswordOff(ctx, st, o); err != nil {
 			return err
 		}
 	}

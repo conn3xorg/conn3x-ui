@@ -878,6 +878,16 @@ func (s *Store) CreateOIDCUser(ctx context.Context, name, issuer, subject string
 	return res.LastInsertId()
 }
 
+// EndPasswordSessions ends every session of a user with no OIDC link,
+// since only a password opens one, and says how many it ended.
+func (s *Store) EndPasswordSessions(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE oidc_subject IS NULL)")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // OIDCAdmins says how many site admins who aren't disabled sign in with
 // OIDC from issuer.
 func (s *Store) OIDCAdmins(ctx context.Context, issuer string) (int, error) {
