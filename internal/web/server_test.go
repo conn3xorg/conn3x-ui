@@ -6,6 +6,7 @@ package web
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +53,8 @@ func waitForInterrupt(ch chan os.Signal) {
 // reaches it through the project's environment, picks what it does:
 // "plan" configures an http backend and plans and applies, "local" leaves
 // state local, "stale" refuses the apply the way a stale plan is refused,
-// "hang" makes the plan wait for an interrupt. An apply writes its stream
+// "hang" makes the plan wait for an interrupt, "creds" prints the
+// credentials it was given and fails with one in its error. An apply writes its stream
 // to -json-into and a report to -report, as a real one does.
 func TestMain(m *testing.M) {
 	mode := os.Getenv("CONN3X_FAKE")
@@ -83,6 +86,22 @@ func TestMain(m *testing.M) {
 	case "plan":
 		if mode == "hang" {
 			waitForInterrupt(interrupt)
+		}
+		if mode == "creds" {
+			path := os.Getenv("CONN3X_CRED_SSH_KEY")
+			key, _ := os.ReadFile(path)
+			fileMode, dirMode := "missing", "missing"
+			if st, err := os.Stat(path); err == nil {
+				fileMode = st.Mode().Perm().String()
+			}
+			if st, err := os.Stat(filepath.Dir(path)); err == nil {
+				dirMode = st.Mode().Perm().String()
+			}
+			line, _ := json.Marshal(map[string]string{"type": "conn3x_fake", "@message": fmt.Sprintf("file %s %s %s %s", path, fileMode, dirMode, key)})
+			fmt.Println(string(line))
+			fmt.Fprintln(os.Stderr, "token "+os.Getenv("API_TOKEN"))
+			fmt.Printf(`{"@level":"error","@message":"Error: bad token","type":"diagnostic","diagnostic":{"severity":"error","summary":"bad token %s","detail":""}}`+"\n", os.Getenv("API_TOKEN"))
+			os.Exit(1)
 		}
 		fmt.Println(changeLine("web2", "build", "create"))
 		fmt.Println(changeLine("web1", "build", "update"))
@@ -539,6 +558,92 @@ func TestCancel(t *testing.T) {
 	if resp := e.post(runPath+"/cancel", url.Values{"csrf": {e.csrf("/")}}); resp.StatusCode != 409 {
 		t.Errorf("cancel of a finished run: %d", resp.StatusCode)
 	}
+}
+
+func TestCredentials(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	e.login(t)
+	project := e.createProject(t, "creds", repo, ".", exe, "CONN3X_FAKE=creds")
+	const sshKey, token = "-----BEGIN KEY-----\nAAAAsecretline\n-----END KEY-----", "tok-Very$ecret-123"
+	add := func(name, kind, value string) *http.Response {
+		return e.post(project+"/credentials", url.Values{"csrf": {e.csrf(project)}, "name": {name}, "kind": {kind}, "value": {value}})
+	}
+
+	// Without a key there's no form, the page says how to make one, and a
+	// save is refused.
+	if _, body := e.get(project); !strings.Contains(body, "openssl rand -base64 32") || strings.Contains(body, `name="value"`) {
+		t.Errorf("project page without a key:\n%s", body)
+	}
+	if resp := add("API_TOKEN", "env", token); resp.StatusCode != 400 {
+		t.Errorf("save without a key: %d", resp.StatusCode)
+	}
+
+	key := make([]byte, 32)
+	rand.Read(key)
+	e.st.SetKey(key)
+	if resp := e.post(project+"/credentials", url.Values{"name": {"API_TOKEN"}, "kind": {"env"}, "value": {token}}); resp.StatusCode != 403 {
+		t.Errorf("save without CSRF: %d", resp.StatusCode)
+	}
+	if resp := add("ssh_key", "file", strings.ReplaceAll(sshKey, "\n", "\r\n")); resp.StatusCode != 303 {
+		t.Fatalf("save file: %d", resp.StatusCode)
+	}
+	if resp := add("API_TOKEN", "env", token+"\r\n"); resp.StatusCode != 303 {
+		t.Fatalf("save env: %d", resp.StatusCode)
+	}
+	resp, err := e.PostForm(e.base+project+"/credentials", url.Values{"csrf": {e.csrf(project)}, "name": {"bad-name"}, "kind": {"env"}, "value": {token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 400 || strings.Contains(string(body), token) {
+		t.Errorf("bad name: %d, and the value came back: %v", resp.StatusCode, strings.Contains(string(body), token))
+	}
+	_, page := e.get(project)
+	for _, want := range []string{"ssh_key", "$CONN3X_CRED_SSH_KEY", "API_TOKEN"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("project page lacks %q", want)
+		}
+	}
+	if strings.Contains(page, "AAAAsecretline") || strings.Contains(page, token) {
+		t.Error("project page shows a saved value")
+	}
+
+	// The run gets them, and its log, its stored lines and its error don't.
+	runPath, events := e.plan(t, project)
+	joined := strings.Join(events, "\n")
+	if strings.Contains(joined, "AAAAsecretline") || strings.Contains(joined, token) || !strings.Contains(joined, "token <hidden>") {
+		t.Errorf("events:\n%s", joined)
+	}
+	m := regexp.MustCompile(`file (\S+) (\S+) (\S+) <hidden>`).FindStringSubmatch(joined)
+	if m == nil || m[2] != "-rw-------" || m[3] != "-rwx------" {
+		t.Fatalf("file credential: %q in\n%s", m, joined)
+	}
+	if _, err := os.Stat(filepath.Dir(m[1])); !os.IsNotExist(err) {
+		t.Errorf("credentials directory outlived the run: %v", err)
+	}
+	rn, _ := e.st.Run(context.Background(), runID(t, runPath))
+	lines, _, _ := e.st.Events(context.Background(), rn.ID)
+	stored := string(slices.Concat(lines...))
+	if strings.Contains(stored, "AAAAsecret") || strings.Contains(stored, token) || strings.Contains(rn.Error, token) || !strings.Contains(rn.Error, "bad token <hidden>") {
+		t.Errorf("stored lines or error hold a secret: %q", rn.Error)
+	}
+
+	e.post(project+"/credentials/API_TOKEN/delete", url.Values{"csrf": {e.csrf(project)}})
+	if _, page := e.get(project); strings.Contains(page, "API_TOKEN") {
+		t.Error("deleted credential still listed")
+	}
+}
+
+func runID(t *testing.T, runPath string) int64 {
+	t.Helper()
+	n, err := strconv.ParseInt(path.Base(runPath), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestLocalStateRefused(t *testing.T) {

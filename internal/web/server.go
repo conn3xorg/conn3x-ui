@@ -70,7 +70,7 @@ type page struct {
 func New(st *store.Store, rn *run.Runner) *Server {
 	s := &Server{Store: st, Runner: rn, Log: log.Default(), pages: map[string]*template.Template{}, mux: http.NewServeMux()}
 	for _, name := range []string{"login", "projects", "project", "run", "runs"} {
-		s.pages[name] = template.Must(template.New("").Funcs(template.FuncMap{"lineText": lineText}).
+		s.pages[name] = template.Must(template.New("").Funcs(template.FuncMap{"lineText": lineText, "credEnv": run.CredentialEnv}).
 			ParseFS(files, "templates/layout.html", "templates/project_form.html", "templates/"+name+".html"))
 	}
 	s.mux.Handle("GET /static/", http.FileServerFS(files))
@@ -83,6 +83,8 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /projects/{id}", s.updateProject)
 	s.mux.HandleFunc("POST /projects/{id}/delete", s.deleteProject)
 	s.mux.HandleFunc("POST /projects/{id}/plan", s.startPlan)
+	s.mux.HandleFunc("POST /projects/{id}/credentials", s.setCredential)
+	s.mux.HandleFunc("POST /projects/{id}/credentials/{name}/delete", s.deleteCredential)
 	s.mux.HandleFunc("GET /runs", s.history)
 	s.mux.HandleFunc("GET /runs/{id}", s.runPage)
 	s.mux.HandleFunc("GET /runs/{id}/report", s.runReport)
@@ -289,12 +291,22 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.projectPage(w, r, p, p, http.StatusOK, "")
+}
+
+// projectPage renders the project page with form in its settings.
+func (s *Server) projectPage(w http.ResponseWriter, r *http.Request, p, form store.Project, status int, errMsg string) {
 	runs, err := s.Store.Runs(r.Context(), p.ID)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	s.render(w, r, "project", http.StatusOK, map[string]any{"Project": p, "Form": p, "Runs": runs}, "")
+	creds, err := s.Store.Credentials(r.Context(), p.ID)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "project", status, map[string]any{"Project": p, "Form": form, "Runs": runs, "Credentials": creds, "HasKey": s.Store.HasKey()}, errMsg)
 }
 
 func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
@@ -309,11 +321,51 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 		err = s.Store.UpdateProject(r.Context(), form)
 	}
 	if err != nil {
-		runs, _ := s.Store.Runs(r.Context(), p.ID)
-		s.render(w, r, "project", http.StatusBadRequest, map[string]any{"Project": p, "Form": form, "Runs": runs}, saveError(err))
+		s.projectPage(w, r, p, form, http.StatusBadRequest, saveError(err))
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
+}
+
+// setCredential adds or replaces one of the project's credentials. The
+// value is never shown again, not even when the form comes back with an
+// error.
+func (s *Server) setCredential(w http.ResponseWriter, r *http.Request) {
+	p, err := s.Store.Project(r.Context(), id(r))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	name, kind := strings.TrimSpace(r.PostFormValue("name")), r.PostFormValue("kind")
+	value := strings.ReplaceAll(r.PostFormValue("value"), "\r\n", "\n")
+	if kind == store.CredEnv {
+		value = strings.TrimRight(value, "\n")
+	} else if !strings.HasSuffix(value, "\n") {
+		value += "\n" // a pasted key loses its last newline, and ssh won't read a key without one
+	}
+	err = run.ValidateCredentialName(name)
+	switch {
+	case err != nil:
+	case kind != store.CredFile && kind != store.CredEnv:
+		err = errors.New("a credential is a file or an environment variable")
+	case strings.TrimSpace(value) == "":
+		err = errors.New("the credential needs a value")
+	default:
+		err = s.Store.SetCredential(r.Context(), p.ID, name, kind, []byte(value))
+	}
+	if err != nil {
+		s.projectPage(w, r, p, p, http.StatusBadRequest, err.Error())
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/projects/%d", p.ID), http.StatusSeeOther)
+}
+
+func (s *Server) deleteCredential(w http.ResponseWriter, r *http.Request) {
+	if err := s.Store.DeleteCredential(r.Context(), id(r), r.PathValue("name")); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/projects/%d", id(r)), http.StatusSeeOther)
 }
 
 func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
