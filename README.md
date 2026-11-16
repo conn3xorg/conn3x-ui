@@ -10,6 +10,8 @@ This is the second slice of the design in [conn3xorg/conn3x#525](https://github.
 
 Each [release](https://github.com/conn3xorg/conn3x-ui/releases) has a binary for Linux, macOS and Windows on amd64 and arm64. Download the archive for your platform, unpack it, and put `conn3x-ui` on your PATH. It still needs `git` and a `conn3x` binary beside it.
 
+To install it on a server, with `conn3x`, `git` and a systemd unit, apply [circuit-conn3x-ui](https://github.com/conn3xorg/circuit-conn3x-ui).
+
 Or run the container image, which has both, plus an ssh client for `git@` URLs:
 
 ```sh
@@ -258,7 +260,7 @@ The rest of the design, in the order it's planned:
 
 - Roles for OIDC groups, more than one provider (GitHub, which isn't OIDC, among them), and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and the audit log are in.
 - Drift notifications by email, and a Check drift button: [#893](https://github.com/conn3xorg/conn3x/issues/893)
-- apt, dnf, Homebrew and Scoop packages, and a circuit that installs it: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries and the image are in.
+- apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).
 
