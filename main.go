@@ -61,6 +61,9 @@ func main() {
 	fs.StringVar(&oc.redirectURL, "oidc-redirect-url", "", "this UI's callback, https://HOST/login/oidc/callback, as registered with the provider")
 	fs.StringVar(&oc.emailDomain, "oidc-email-domain", "", "only let in OIDC users with a verified email in this domain")
 	fs.BoolVar(&oc.noPassword, "no-password-sign-in", false, "turn off sign-in with a password, once a site admin signs in with OIDC")
+	fs.StringVar(&oc.groupsClaim, "oidc-groups-claim", "groups", "ID token claim that lists a user's groups")
+	fs.StringVar(&oc.adminGroup, "oidc-admin-group", "", "OIDC group whose members are site admins, checked at each sign-in")
+	fs.Var(&oc.roles, "oidc-role", "GROUP=PROJECT:ROLE gives the group's members that role on the project, checked at each sign-in; repeat it for more")
 	publicURL := fs.String("public-url", "", "this UI's address, such as https://conn3x.example.com, for full links in webhooks")
 	var mc mailConfig
 	fs.StringVar(&mc.addr, "smtp-addr", "", "SMTP server, host:port, for drift emails; STARTTLS is required except on loopback")
@@ -112,6 +115,21 @@ func loadKey(file, env string) ([]byte, error) {
 type oidcConfig struct {
 	issuer, clientID, secretFile, redirectURL, emailDomain string
 	noPassword                                             bool
+	groupsClaim, adminGroup                                string
+	roles                                                  roleFlags
+}
+
+// roleFlags collects each -oidc-role.
+type roleFlags []web.GroupRole
+
+func (f *roleFlags) String() string { return fmt.Sprint(*f) }
+
+func (f *roleFlags) Set(s string) error {
+	gr, err := web.ParseGroupRole(s)
+	if err == nil {
+		*f = append(*f, gr)
+	}
+	return err
 }
 
 // oidcSecretEnv holds the OIDC client secret when -oidc-client-secret-file
@@ -126,6 +144,9 @@ func setupOIDC(ctx context.Context, oc oidcConfig) (*web.OIDC, error) {
 	secret := os.Getenv(oidcSecretEnv)
 	os.Unsetenv(oidcSecretEnv)
 	if oc.issuer == "" {
+		if oc.adminGroup != "" || len(oc.roles) > 0 {
+			return nil, errors.New("-oidc-admin-group and -oidc-role need -oidc-issuer")
+		}
 		return nil, nil
 	}
 	if oc.clientID == "" || oc.redirectURL == "" {
@@ -138,7 +159,11 @@ func setupOIDC(ctx context.Context, oc oidcConfig) (*web.OIDC, error) {
 		}
 		secret = string(b)
 	}
-	return web.NewOIDC(ctx, oc.issuer, oc.clientID, strings.TrimSpace(secret), oc.redirectURL, oc.emailDomain)
+	o, err := web.NewOIDC(ctx, oc.issuer, oc.clientID, strings.TrimSpace(secret), oc.redirectURL, oc.emailDomain)
+	if err == nil {
+		o.GroupsClaim, o.AdminGroup, o.GroupRoles = oc.groupsClaim, oc.adminGroup, oc.roles
+	}
+	return o, err
 }
 
 // rotateKey re-seals every credential in data's database under the new

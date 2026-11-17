@@ -64,7 +64,7 @@
   {{if .Data.Members}}
   <table>
     <tr><th>User</th><th>Role</th></tr>
-    {{range .Data.Members}}<tr><td>{{.Name}}</td><td>{{.Role}}</td></tr>{{end}}
+    {{range .Data.Members}}<tr><td>{{.Name}}</td><td>{{.Role}}{{if .FromGroup}} <small>from OIDC groups</small>{{end}}</td></tr>{{end}}
   </table>
   {{else}}<p>Nobody has a role here yet. Site admins are admin on every project.</p>{{end}}
   <form method="post" action="/projects/{{.Data.Project.ID}}/roles">

@@ -271,6 +271,26 @@ Under **App registrations**, register an app:
 
 The issuer is `https://login.microsoftonline.com/TENANT_ID/v2.0` and the client ID is the app's **Application (client) ID**. A single-tenant app already keeps out anyone outside your directory, and Entra doesn't say whether an email is verified, so leave `-oidc-email-domain` off.
 
+### Roles from groups
+
+Let your provider's groups decide who can do what, so joining or leaving a team in one place is enough:
+
+```sh
+./conn3x-ui serve ... \
+  -oidc-admin-group conn3x-admins \
+  -oidc-role 'platform=web:approver' \
+  -oidc-role 'developers=web:planner' \
+  -oidc-role 'developers=db:viewer'
+```
+
+`-oidc-admin-group` makes its members site admins. Each `-oidc-role GROUP=PROJECT:ROLE` gives the group's members that role on the project, by the project's name; a project that doesn't exist yet is skipped until it does. Both are checked at every OIDC sign-in, so somebody who leaves a group loses what it gave them the next time they sign in, not before.
+
+- **The highest role wins.** In `platform` and `developers`, you're an approver on `web`.
+- **A role set by hand stays yours.** Groups never change or remove a role an admin gave under the project's roles, and giving someone a role by hand takes it over from their groups. The project page marks the ones that came from groups.
+- **The last site admin stays one.** If leaving the admin group would leave nobody who can sign in as a site admin, the UI keeps them one and says so in the audit log.
+
+The groups come from the ID token's `groups` claim; `-oidc-groups-claim` names another. Your provider has to put it there. In Keycloak, add a **Group Membership** mapper to the client with the token claim name `groups`, and turn **Full group path** off so the names match. Entra ID puts group object IDs in the claim once you add a groups claim under **Token configuration**, so use those IDs as the group names. Every change a sign-in makes is in the audit log.
+
 ### Turning off passwords
 
 Once single sign-on works, you can turn off password sign-in with `-no-password-sign-in`. It won't lock you out: the UI refuses to start with it until a site admin who isn't disabled signs in with OIDC. So sign in with OIDC once, make that user a site admin under **Users** while signed in as `admin`, then restart with the flag. Starting with it signs out every session that was opened with a password, and the audit log says how many. From then on every admin signs in with OIDC, and nobody can drop their own admin, so one is always left.
@@ -295,7 +315,7 @@ To keep it somewhere else, such as a SIEM, download it from the page: **JSON lin
 
 The rest of the design, in the order it's planned:
 
-- Roles for OIDC groups, and more than one provider (GitHub, which isn't OIDC, among them): [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person, and the audit log and its export are in.
+- More than one sign-in provider (GitHub, which isn't OIDC, among them): [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and per OIDC group, and the audit log and its export are in.
 - apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).
