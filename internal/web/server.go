@@ -110,6 +110,7 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("GET /account", s.account)
 	s.mux.HandleFunc("POST /account/password", s.changePassword)
 	s.mux.HandleFunc("GET /audit", s.auditPage)
+	s.mux.HandleFunc("GET /audit/export", s.auditExport)
 	return s
 }
 

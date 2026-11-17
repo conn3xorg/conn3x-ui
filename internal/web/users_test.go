@@ -6,11 +6,14 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -348,5 +351,62 @@ func TestAudit(t *testing.T) {
 	}
 	if _, body := e.get("/audit?user=1&page=2"); strings.Contains(body, "<td>plan</td>") || !strings.Contains(body, "Newer") {
 		t.Errorf("page 2:\n%s", body)
+	}
+}
+
+// A site admin downloads the audit log as JSON lines or CSV, oldest first,
+// with the page's filters and after=ID; a cell a spreadsheet would read as
+// a formula is quoted; the download is itself in the log; and nobody else
+// gets one.
+func TestAuditExport(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	e.login(t)
+	for _, d := range []string{"first", "=HYPERLINK(\"http://x\")", "third"} {
+		if err := e.st.Audit(ctx, store.Entry{UserName: "admin", UserID: 1, Action: "note", Detail: d}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp, body := e.get("/audit/export")
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/x-ndjson" || !strings.Contains(resp.Header.Get("Content-Disposition"), "conn3x-ui-audit.jsonl") {
+		t.Fatalf("jsonl: %d %v", resp.StatusCode, resp.Header)
+	}
+	var ids []int64
+	var details []string
+	for _, l := range strings.Split(strings.TrimSpace(body), "\n") {
+		var m struct {
+			ID     int64  `json:"id"`
+			Action string `json:"action"`
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("%q: %v", l, err)
+		}
+		ids = append(ids, m.ID)
+		if m.Action == "note" {
+			details = append(details, m.Detail)
+		}
+	}
+	if !slices.IsSorted(ids) || strings.Join(details, "|") != `first|=HYPERLINK("http://x")|third` {
+		t.Errorf("ids %v, details %v", ids, details)
+	}
+	// after skips what an earlier export had.
+	last := ids[len(ids)-1]
+	if _, body := e.get(fmt.Sprintf("/audit/export?after=%d", last)); strings.Contains(body, `"third"`) || !strings.Contains(body, `"audit export"`) {
+		t.Errorf("after %d:\n%s", last, body)
+	}
+	_, body = e.get("/audit/export?format=csv")
+	if !strings.HasPrefix(body, "id,at,user_id,user,project_id,project,action,detail\n") || !strings.Contains(body, `"'=HYPERLINK(""http://x"")"`) {
+		t.Errorf("csv:\n%s", body)
+	}
+	if resp, _ := e.get("/audit/export?format=xml"); resp.StatusCode != 400 {
+		t.Errorf("xml: %d", resp.StatusCode)
+	}
+	if !strings.Contains(strings.Join(auditLines(t, e.st), "\n"), "audit export jsonl, user 0, project 0, after 0") {
+		t.Errorf("the export isn't in the log:\n%s", strings.Join(auditLines(t, e.st), "\n"))
+	}
+	bob := e.user(t, "bob", "", "")
+	if resp, _ := bob.get("/audit/export"); resp.StatusCode == 200 {
+		t.Errorf("a user who isn't a site admin got the export")
 	}
 }

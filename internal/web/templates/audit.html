@@ -12,6 +12,7 @@
   </select></span>
   <button>Filter</button>
 </form>
+<p><small>Download every entry these filters match, oldest first: <a href="/audit/export?format=jsonl&amp;user={{.Data.Filter.UserID}}&amp;project={{.Data.Filter.ProjectID}}">JSON lines</a> or <a href="/audit/export?format=csv&amp;user={{.Data.Filter.UserID}}&amp;project={{.Data.Filter.ProjectID}}">CSV</a>. Add <code>after=ID</code> to get only what's newer than an earlier download.</small></p>
 {{if .Data.Entries}}
 <table>
   <tr><th>When</th><th>User</th><th>Project</th><th>Action</th><th>Detail</th></tr>

@@ -284,15 +284,18 @@ Who did what, and when. **Audit**, for site admins, lists it newest first, 50 to
 - users created, by an admin or at a first OIDC sign-in, passwords reset or changed, site admin and disabled changes, and roles given or taken away.
 - projects created, edited and deleted; drift schedule changes, and webhook changes by host only.
 - credentials set or deleted, by name, and the key rotated, by count.
-- plans, applies and cancels, with the run.
+- plans, applies and cancels, with the run, drift checks somebody started, and schedule mode changes.
+- downloads of the log itself.
 
 No password or credential value is ever in it. An entry keeps the user's and project's names as they were, so it still reads right after either is gone. The table is append-only: the database refuses to change or delete an entry.
+
+To keep it somewhere else, such as a SIEM, download it from the page: **JSON lines** or **CSV**, every entry the filters match, oldest first. `GET /audit/export?format=jsonl&after=ID` returns only what's newer than entry `ID`, so a job can pull what's new each night. In the CSV, a cell that starts with `=`, `+`, `-` or `@` gets a `'` in front, so a spreadsheet doesn't run a name or detail as a formula.
 
 ## Not here yet
 
 The rest of the design, in the order it's planned:
 
-- Roles for OIDC groups, more than one provider (GitHub, which isn't OIDC, among them), and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and the audit log are in.
+- Roles for OIDC groups, and more than one provider (GitHub, which isn't OIDC, among them): [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person, and the audit log and its export are in.
 - apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).

@@ -4,6 +4,9 @@
 package web
 
 import (
+	"cmp"
+	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -168,6 +171,59 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r.Context(), u, store.Project{}, "password change", "")
 	s.render(w, r, "account", http.StatusOK, "Your password is changed. Your other sessions are signed out.", "")
+}
+
+// auditExport writes every audit entry that matches the page's filters,
+// oldest first, as JSON lines or CSV, for a SIEM or an auditor. after=ID
+// starts past the last entry an earlier export got. The export is itself
+// an audit entry.
+func (s *Server) auditExport(w http.ResponseWriter, r *http.Request) {
+	if !s.siteAdmin(w, r) {
+		return
+	}
+	q := r.URL.Query()
+	var f store.AuditFilter
+	f.UserID, _ = strconv.ParseInt(q.Get("user"), 10, 64)
+	f.ProjectID, _ = strconv.ParseInt(q.Get("project"), 10, 64)
+	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+	format := cmp.Or(q.Get("format"), "jsonl")
+	if format != "jsonl" && format != "csv" {
+		http.Error(w, "format is jsonl or csv", http.StatusBadRequest)
+		return
+	}
+	s.audit(r.Context(), sess(r).user, store.Project{}, "audit export", fmt.Sprintf("%s, user %d, project %d, after %d", format, f.UserID, f.ProjectID, after))
+	name := "conn3x-ui-audit." + format
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	var write func(store.Entry) error
+	if format == "csv" {
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		cw := csv.NewWriter(w)
+		defer cw.Flush()
+		cw.Write([]string{"id", "at", "user_id", "user", "project_id", "project", "action", "detail"})
+		write = func(e store.Entry) error {
+			return cw.Write([]string{strconv.FormatInt(e.ID, 10), e.At, strconv.FormatInt(e.UserID, 10), cell(e.UserName),
+				strconv.FormatInt(e.ProjectID, 10), cell(e.ProjectName), cell(e.Action), cell(e.Detail)})
+		}
+	} else {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		enc := json.NewEncoder(w)
+		write = func(e store.Entry) error {
+			return enc.Encode(map[string]any{"id": e.ID, "at": e.At, "user_id": e.UserID, "user": e.UserName,
+				"project_id": e.ProjectID, "project": e.ProjectName, "action": e.Action, "detail": e.Detail})
+		}
+	}
+	if err := s.Store.AuditEach(r.Context(), f, after, write); err != nil {
+		s.Log.Printf("audit export: %v", err)
+	}
+}
+
+// cell keeps text a spreadsheet would run as a formula from being one:
+// names and details come from users.
+func cell(v string) string {
+	if v != "" && strings.ContainsRune("=+-@\t\r", rune(v[0])) {
+		return "'" + v
+	}
+	return v
 }
 
 // auditPage is the audit log, newest first, filtered by user and project,
