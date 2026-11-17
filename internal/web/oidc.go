@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,14 +26,19 @@ import (
 
 // OIDC signs people in with one OpenID Connect provider: the authorization
 // code flow with PKCE, a state and a nonce.
-// shortcut: one provider, and no roles for its groups; more providers and
-// group roles are the rest of #892.
+// shortcut: one provider; more providers are the rest of #892.
 type OIDC struct {
 	// Issuer is the provider's issuer URL, as it states it.
 	Issuer string
 	// EmailDomain, when set, is the only domain whose verified emails may
 	// sign in.
 	EmailDomain string
+	// GroupsClaim names the ID token claim that lists the user's groups.
+	// AdminGroup's members are site admins, and GroupRoles give roles on
+	// projects; with neither, groups change nothing.
+	GroupsClaim string
+	AdminGroup  string
+	GroupRoles  []GroupRole
 	oauth       oauth2.Config
 	verifier    *oidc.IDTokenVerifier
 	client      *http.Client
@@ -182,7 +188,11 @@ func (s *Server) oidcUser(r *http.Request, o *OIDC, code, state, providerErr str
 		EmailVerified     any    `json:"email_verified"`
 		PreferredUsername string `json:"preferred_username"`
 	}
+	var all map[string]any
 	if err := idt.Claims(&c); err != nil {
+		return store.User{}, fmt.Errorf("ID token claims: %w", err)
+	}
+	if err := idt.Claims(&all); err != nil {
 		return store.User{}, fmt.Errorf("ID token claims: %w", err)
 	}
 	if o.EmailDomain != "" {
@@ -203,7 +213,87 @@ func (s *Server) oidcUser(r *http.Request, o *OIDC, code, state, providerErr str
 	if u.Disabled {
 		return u, errors.New("disabled user")
 	}
-	return u, nil
+	return s.syncGroups(r, o, u, groups(all, cmp.Or(o.GroupsClaim, "groups")))
+}
+
+// GroupRole gives the members of an OIDC group a role on a project, by
+// the project's name.
+type GroupRole struct{ Group, Project, Role string }
+
+// ParseGroupRole reads GROUP=PROJECT:ROLE, as -oidc-role takes it.
+func ParseGroupRole(s string) (GroupRole, error) {
+	g, rest, ok := strings.Cut(s, "=")
+	i := strings.LastIndex(rest, ":")
+	if !ok || g == "" || i <= 0 || !slices.Contains(store.Roles, rest[i+1:]) {
+		return GroupRole{}, fmt.Errorf("-oidc-role %q must be GROUP=PROJECT:ROLE, with a role one of %s", s, strings.Join(store.Roles, ", "))
+	}
+	return GroupRole{Group: g, Project: rest[:i], Role: rest[i+1:]}, nil
+}
+
+// groups reads the groups claim: a list of strings, or one string.
+func groups(claims map[string]any, name string) []string {
+	switch v := claims[name].(type) {
+	case string:
+		return []string{v}
+	case []any:
+		var out []string
+		for _, g := range v {
+			if s, ok := g.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// syncGroups sets u's site admin bit and group roles from their OIDC
+// groups, at each sign-in, and audits what changed. A role an admin set by
+// hand wins over a group's, and the last site admin is never demoted.
+func (s *Server) syncGroups(r *http.Request, o *OIDC, u store.User, have []string) (store.User, error) {
+	if o.AdminGroup == "" && len(o.GroupRoles) == 0 {
+		return u, nil
+	}
+	ctx := r.Context()
+	in := func(g string) bool { return slices.Contains(have, g) }
+	if o.AdminGroup != "" && in(o.AdminGroup) != u.Admin {
+		switch err := s.Store.SetAdmin(ctx, u.ID, in(o.AdminGroup)); {
+		case errors.Is(err, store.ErrLastAdmin):
+			s.audit(ctx, u, store.Project{}, "user edit", u.Name+": stays a site admin, as the last one, though not in "+o.AdminGroup)
+		case err != nil:
+			return u, err
+		default:
+			s.audit(ctx, u, store.Project{}, "user edit", fmt.Sprintf("%s: site admin %v, from OIDC group %s", u.Name, in(o.AdminGroup), o.AdminGroup))
+		}
+	}
+	if len(o.GroupRoles) > 0 {
+		ps, err := s.Store.Projects(ctx)
+		if err != nil {
+			return u, err
+		}
+		byName := map[string]int64{}
+		for _, p := range ps {
+			byName[strings.ToLower(p.Name)] = p.ID
+		}
+		want := map[int64]string{}
+		for _, gr := range o.GroupRoles {
+			pid, ok := byName[strings.ToLower(gr.Project)]
+			if !ok || !in(gr.Group) {
+				continue
+			}
+			if !store.RoleAtLeast(want[pid], gr.Role) {
+				want[pid] = gr.Role // the highest role any of their groups gives
+			}
+		}
+		changes, err := s.Store.SyncGroupRoles(ctx, u.ID, want)
+		if err != nil {
+			return u, err
+		}
+		for _, c := range changes {
+			s.audit(ctx, u, store.Project{}, "role change", u.Name+", from OIDC groups: "+c)
+		}
+	}
+	return s.Store.User(ctx, u.ID)
 }
 
 var notNameChar = regexp.MustCompile(`[^A-Za-z0-9._@-]+`)

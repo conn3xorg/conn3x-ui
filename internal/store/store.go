@@ -152,6 +152,9 @@ var migrations = []string{
 	`ALTER TABLE projects ADD COLUMN splay_minutes INTEGER NOT NULL DEFAULT 0;`,
 	// 10: who gets an email when a drift check finds drift or fails.
 	`ALTER TABLE projects ADD COLUMN notify_email TEXT NOT NULL DEFAULT '';`,
+	// 11: which roles came from a user's OIDC groups, so a sign-in can
+	// change them without touching the ones an admin gave by hand.
+	`ALTER TABLE roles ADD COLUMN from_group INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Store is the database.
@@ -1079,6 +1082,8 @@ type Member struct {
 	UserID int64
 	Name   string
 	Role   string
+	// FromGroup is a role the user's OIDC groups gave them.
+	FromGroup bool
 }
 
 // Role returns a user's role on a project, "" for none.
@@ -1101,14 +1106,94 @@ func (s *Store) SetRole(ctx context.Context, projectID, userID int64, role strin
 	if !slices.Contains(Roles, role) {
 		return fmt.Errorf("%q isn't a role; a role is one of %s", role, strings.Join(Roles, ", "))
 	}
-	_, err := s.db.ExecContext(ctx, "INSERT INTO roles (project_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (project_id, user_id) DO UPDATE SET role=excluded.role",
+	// A role set by hand is the admin's from then on, whatever groups say.
+	_, err := s.db.ExecContext(ctx, "INSERT INTO roles (project_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (project_id, user_id) DO UPDATE SET role=excluded.role, from_group=0",
 		projectID, userID, role)
+	return err
+}
+
+// SyncGroupRoles makes userID's roles from OIDC groups exactly want, by
+// project. A role an admin set by hand stays as it is: groups never
+// replace or remove it. It returns what changed, for the audit log.
+func (s *Store) SyncGroupRoles(ctx context.Context, userID int64, want map[int64]string) ([]string, error) {
+	for _, r := range want {
+		if !slices.Contains(Roles, r) {
+			return nil, fmt.Errorf("%q isn't a role", r)
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	had := map[int64]string{}
+	rows, err := tx.QueryContext(ctx, "SELECT project_id, role FROM roles WHERE user_id=? AND from_group=1", userID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var pid int64
+		var r string
+		if err := rows.Scan(&pid, &r); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		had[pid] = r
+	}
+	rows.Close()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM roles WHERE user_id=? AND from_group=1", userID); err != nil {
+		return nil, err
+	}
+	got := map[int64]string{}
+	for pid, r := range want {
+		res, err := tx.ExecContext(ctx, "INSERT INTO roles (project_id, user_id, role, from_group) VALUES (?, ?, ?, 1) ON CONFLICT (project_id, user_id) DO NOTHING", pid, userID, r)
+		if err != nil {
+			return nil, err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			got[pid] = r
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	var changes []string
+	for pid, r := range got {
+		if had[pid] != r {
+			changes = append(changes, fmt.Sprintf("project %d: %s", pid, r))
+		}
+	}
+	for pid := range had {
+		if _, ok := got[pid]; !ok {
+			changes = append(changes, fmt.Sprintf("project %d: none", pid))
+		}
+	}
+	slices.Sort(changes)
+	return changes, nil
+}
+
+// ErrLastAdmin is a change that would leave no site admin who can sign in.
+var ErrLastAdmin = errors.New("that would leave no site admin")
+
+// SetAdmin makes a user a site admin or not, unless taking it away would
+// leave no site admin who isn't disabled.
+func (s *Store) SetAdmin(ctx context.Context, id int64, admin bool) error {
+	if !admin {
+		var others int
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE admin=1 AND disabled=0 AND id<>?", id).Scan(&others); err != nil {
+			return err
+		}
+		if others == 0 {
+			return ErrLastAdmin
+		}
+	}
+	_, err := s.db.ExecContext(ctx, "UPDATE users SET admin=? WHERE id=?", admin, id)
 	return err
 }
 
 // Members returns who has a role on a project, by name.
 func (s *Store) Members(ctx context.Context, projectID int64) ([]Member, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT u.id, u.name, r.role FROM roles r JOIN users u ON u.id = r.user_id WHERE r.project_id=? ORDER BY u.name", projectID)
+	rows, err := s.db.QueryContext(ctx, "SELECT u.id, u.name, r.role, r.from_group FROM roles r JOIN users u ON u.id = r.user_id WHERE r.project_id=? ORDER BY u.name", projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -1116,7 +1201,7 @@ func (s *Store) Members(ctx context.Context, projectID int64) ([]Member, error) 
 	var out []Member
 	for rows.Next() {
 		var m Member
-		if err := rows.Scan(&m.UserID, &m.Name, &m.Role); err != nil {
+		if err := rows.Scan(&m.UserID, &m.Name, &m.Role, &m.FromGroup); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

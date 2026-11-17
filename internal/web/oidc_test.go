@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -329,5 +330,86 @@ func TestPasswordOff(t *testing.T) {
 	}
 	if resp, _ := off.fresh().signIn(t, "olive", nil); resp.StatusCode != 303 {
 		t.Errorf("OIDC sign-in while passwords are off: %d", resp.StatusCode)
+	}
+}
+
+// OIDC groups set a user's site admin bit and group roles at each sign-in.
+// The highest role any group gives wins; a role set by hand stays; and the
+// last site admin who can sign in is never demoted.
+func TestOIDCGroups(t *testing.T) {
+	e := setupOIDC(t)
+	ctx := context.Background()
+	web, err := e.st.CreateProject(ctx, store.Project{Name: "web", GitURL: "https://example.com/r.git", GitRef: "main", Path: ".", Conn3xPath: "conn3x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := e.st.CreateProject(ctx, store.Project{Name: "db", GitURL: "https://example.com/r.git", GitRef: "main", Path: ".", Conn3xPath: "conn3x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := e.srv.OIDC
+	o.AdminGroup = "admins"
+	for _, s := range []string{"devs=web:planner", "ops=WEB:approver", "ops=db:viewer", "ops=gone:admin"} {
+		gr, err := ParseGroupRole(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.GroupRoles = append(o.GroupRoles, gr)
+	}
+	signIn := func(sub string, groups ...any) store.User {
+		t.Helper()
+		if resp, body := e.fresh().signIn(t, sub, func(c map[string]any, _ url.Values) { c["groups"] = groups }); resp.StatusCode != 303 {
+			t.Fatalf("%s: %d\n%s", sub, resp.StatusCode, body)
+		}
+		u, err := e.st.OIDCUser(ctx, o.Issuer, sub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	role := func(u store.User, pid int64) string {
+		t.Helper()
+		r, err := e.st.Role(ctx, pid, u.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	sam := signIn("sam", "devs", "ops", "admins")
+	if !sam.Admin || role(sam, web) != store.RoleApprover || role(sam, db) != store.RoleViewer {
+		t.Errorf("sam: admin %v, web %q, db %q", sam.Admin, role(sam, web), role(sam, db))
+	}
+	sam = signIn("sam", "devs")
+	if sam.Admin || role(sam, web) != store.RolePlanner || role(sam, db) != "" {
+		t.Errorf("sam, devs only: admin %v, web %q, db %q", sam.Admin, role(sam, web), role(sam, db))
+	}
+	// A role set by hand stays, whatever the groups say.
+	if err := e.st.SetRole(ctx, db, sam.ID, store.RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	sam = signIn("sam")
+	if role(sam, web) != "" || role(sam, db) != store.RoleAdmin {
+		t.Errorf("sam, no groups: web %q, db %q", role(sam, web), role(sam, db))
+	}
+	// The last site admin who can sign in stays one.
+	sam = signIn("sam", "admins")
+	admins, _ := e.st.Users(ctx)
+	for _, u := range admins {
+		if u.Name == "admin" {
+			e.st.SetUser(ctx, u.ID, true, true)
+		}
+	}
+	if sam = signIn("sam"); !sam.Admin {
+		t.Error("the last site admin was demoted")
+	}
+	lines := strings.Join(auditLines(t, e.st), "\n")
+	for _, want := range []string{"site admin true, from OIDC group admins", fmt.Sprintf("from OIDC groups: project %d: approver", web), "stays a site admin, as the last one"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("audit lacks %q:\n%s", want, lines)
+		}
+	}
+	if _, err := ParseGroupRole("ops=web:boss"); err == nil {
+		t.Error("a role that isn't one parsed")
 	}
 }
