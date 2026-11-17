@@ -150,6 +150,8 @@ var migrations = []string{
 	// 9: a random delay, up to this many minutes, before a due drift check
 	// starts.
 	`ALTER TABLE projects ADD COLUMN splay_minutes INTEGER NOT NULL DEFAULT 0;`,
+	// 10: who gets an email when a drift check finds drift or fails.
+	`ALTER TABLE projects ADD COLUMN notify_email TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is the database.
@@ -236,8 +238,11 @@ type Project struct {
 	// many minutes, picked fresh each time, so projects on one schedule
 	// don't all start at once. 0 starts it as soon as it's due.
 	SplayMinutes int
-	CreatedAt    string
-	UpdatedAt    string
+	// NotifyEmail is the comma-separated addresses that get an email
+	// whenever the webhook would get a POST.
+	NotifyEmail string
+	CreatedAt   string
+	UpdatedAt   string
 }
 
 // WebhookHost is the webhook URL's host, all a page shows of it.
@@ -259,11 +264,11 @@ func (p Project) EnvList() []string {
 	return out
 }
 
-const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, self_apply, schedule_mode, max_changes, splay_minutes, created_at, updated_at"
+const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, self_apply, schedule_mode, max_changes, splay_minutes, notify_email, created_at, updated_at"
 
 func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 	var p Project
-	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.SelfApply, &p.ScheduleMode, &p.MaxChanges, &p.SplayMinutes, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.SelfApply, &p.ScheduleMode, &p.MaxChanges, &p.SplayMinutes, &p.NotifyEmail, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -276,8 +281,8 @@ func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 	if p.ScheduleMode == "" {
 		p.ScheduleMode = ModeReport
 	}
-	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, p.ScheduleMode, p.MaxChanges, p.SplayMinutes, t, t)
+	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, p.ScheduleMode, p.MaxChanges, p.SplayMinutes, p.NotifyEmail, t, t)
 	if err != nil {
 		return 0, err
 	}
@@ -289,8 +294,8 @@ func (s *Store) UpdateProject(ctx context.Context, p Project) error {
 	if p.ScheduleMode == "" {
 		p.ScheduleMode = ModeReport
 	}
-	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, self_apply=?, schedule_mode=?, max_changes=?, splay_minutes=?, updated_at=? WHERE id=?",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, p.ScheduleMode, p.MaxChanges, p.SplayMinutes, now(), p.ID)
+	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, self_apply=?, schedule_mode=?, max_changes=?, splay_minutes=?, notify_email=?, updated_at=? WHERE id=?",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, p.ScheduleMode, p.MaxChanges, p.SplayMinutes, p.NotifyEmail, now(), p.ID)
 	if err != nil {
 		return err
 	}

@@ -36,6 +36,9 @@
 {{end}}<label for="webhook_url">Drift webhook</label>
 <input id="webhook_url" name="webhook_url" autocomplete="off" spellcheck="false" placeholder="https://hooks.slack.com/services/...">
 <small>Gets a JSON POST when a check finds drift or fails.{{with .Data.Form.WebhookHost}} One is set, to {{.}}; leave this blank to keep it.{{end}}</small>
+<label for="notify_email">Drift email</label>
+<input id="notify_email" name="notify_email" value="{{.Data.Form.NotifyEmail}}" placeholder="ops@example.com, oncall@example.com">
+<small>Gets an email whenever a webhook would get a POST.{{if not .Data.HasMail}} This UI has no mail server yet: a site admin starts it with <code>-smtp-addr</code> and <code>-smtp-from</code>.{{end}}</small>
 <label><input type="checkbox" name="self_apply" value="1" style="width:auto"{{if .Data.Form.SelfApply}} checked{{end}}> Planners may apply their own plans</label>
 <small>Off, a plan needs someone else to apply it: an approver, or an admin.</small>
 {{if .Data.Form.WebhookHost}}<label><input type="checkbox" name="webhook_clear" value="1" style="width:auto"> Remove the webhook</label>{{end}}

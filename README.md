@@ -190,6 +190,14 @@ When a check corrects or converges, the webhook hears twice: once for the drift,
 
 The URL must be `http://` or `https://`. Webhook URLs often carry a token, so once saved the page shows only the host, and the log never prints it. Leave the field blank to keep the saved one, or tick **Remove the webhook**.
 
+Rather have an email? Give the project **Drift email** addresses, comma-separated, and they get one every time the webhook would get a POST, whether or not there's a webhook. The subject is the payload's `text`, and the body adds the hosts and the run's link. Start the UI with a mail server for it:
+
+```sh
+CONN3X_UI_SMTP_PASSWORD=... ./conn3x-ui serve -smtp-addr smtp.example.com:587 -smtp-from conn3x@example.com -smtp-user conn3x
+```
+
+The UI only sends mail over STARTTLS, except to a server on loopback, such as a local relay. `-smtp-password-file` takes the password from a file instead, and the UI takes the variable out of its environment once it's read. A mail that can't be sent is logged, and the run stands as it ended.
+
 ## Trust model
 
 Every run executes a project's circuit on this server, as the user the UI runs as. A circuit can run commands on the machine that plans it, for example through an `external` data source, and that user can read the UI's database and its credentials key. So:
@@ -285,7 +293,6 @@ No password or credential value is ever in it. An entry keeps the user's and pro
 The rest of the design, in the order it's planned:
 
 - Roles for OIDC groups, more than one provider (GitHub, which isn't OIDC, among them), and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and the audit log are in.
-- Drift notifications by email: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).

@@ -47,6 +47,11 @@ type Runner struct {
 	// PublicURL is the UI's address, such as https://conn3x.example.com,
 	// for full links in webhooks. Empty leaves them as paths.
 	PublicURL string
+	// Mailer sends a project's notifications to its email addresses; nil
+	// when the UI has no SMTP server.
+	Mailer interface {
+		Send(to []string, subject, body string) error
+	}
 
 	ctx     context.Context
 	wg      sync.WaitGroup

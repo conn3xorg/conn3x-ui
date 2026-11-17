@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/conn3xorg/conn3x-ui/internal/mail"
 	"github.com/conn3xorg/conn3x-ui/internal/run"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
@@ -386,6 +387,11 @@ func projectForm(r *http.Request) (store.Project, error) {
 	if p.SplayMinutes, err = strconv.Atoi(f("splay_minutes", "0")); err != nil || p.SplayMinutes < 0 || p.SplayMinutes > 1440 {
 		return p, errors.New("the splay is a whole number of minutes, from 0 to 1440")
 	}
+	to, err := mail.ParseAddresses(r.PostFormValue("notify_email"))
+	if err != nil {
+		return p, err
+	}
+	p.NotifyEmail = strings.Join(to, ", ")
 	return p, nil
 }
 
@@ -435,7 +441,7 @@ func (s *Server) projectPage(w http.ResponseWriter, r *http.Request, p, form sto
 		s.fail(w, err)
 		return
 	}
-	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey()}
+	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey(), "HasMail": s.Runner.Mailer != nil}
 	if store.RoleAtLeast(role, store.RoleAdmin) {
 		if d["Credentials"], err = s.Store.Credentials(r.Context(), p.ID); err == nil {
 			if d["Members"], err = s.Store.Members(r.Context(), p.ID); err == nil {
