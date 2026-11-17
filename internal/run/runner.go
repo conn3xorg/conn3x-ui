@@ -26,6 +26,7 @@ import (
 
 	conn3xexec "github.com/conn3xorg/conn3x-exec"
 
+	"github.com/conn3xorg/conn3x-ui/internal/sandbox"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
 
@@ -43,7 +44,10 @@ type Runner struct {
 	DataDir string
 	// Git is the git binary. Empty means "git" on PATH.
 	Git string
-	Log *log.Logger
+	// Sandbox runs conn3x with only its run's checkout and credentials,
+	// not the UI's data or other runs. Linux only.
+	Sandbox bool
+	Log     *log.Logger
 	// PublicURL is the UI's address, such as https://conn3x.example.com,
 	// for full links in webhooks. Empty leaves them as paths.
 	PublicURL string
@@ -399,11 +403,12 @@ var ErrLocalState = errors.New("this configuration keeps its state in a local fi
 
 // checkout clones p's ref into a fresh temp directory and, when sha is
 // set, moves to that commit instead of the ref's current head. It returns
-// the directory conn3x runs in, the commit, and how to remove it all.
-func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha string, env []string) (work, commit string, cleanup func(), err error) {
-	tmp, err := os.MkdirTemp("", "conn3x-ui-run-")
+// the directory conn3x runs in, the commit, and the run's own directory,
+// which holds it all and is for the caller to remove.
+func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha string, env []string) (work, commit, tmp string, err error) {
+	tmp, err = os.MkdirTemp("", "conn3x-ui-run-")
 	if err != nil {
-		return "", "", nil, err
+		return "", "", "", err
 	}
 	defer func() {
 		if err != nil {
@@ -411,47 +416,53 @@ func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha st
 		}
 	}()
 	repo := filepath.Join(tmp, "repo")
+	if err = os.Mkdir(filepath.Join(tmp, "tmp"), 0o700); err != nil {
+		return "", "", "", err
+	}
 
 	r.note(id, fmt.Sprintf("git clone --depth 1 --branch %s %s", p.GitRef, redactURL(p.GitURL)))
 	if out, err := r.git(ctx, env, "clone", "--quiet", "--depth", "1", "--branch", p.GitRef, "--", p.GitURL, repo); err != nil {
-		return "", "", nil, fmt.Errorf("git clone: %v: %s", err, strings.TrimSpace(string(out)))
+		return "", "", "", fmt.Errorf("git clone: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	if sha != "" {
 		if !commitSHA.MatchString(sha) {
-			return "", "", nil, fmt.Errorf("the plan's commit %q isn't a commit ID", sha)
+			return "", "", "", fmt.Errorf("the plan's commit %q isn't a commit ID", sha)
 		}
 		r.note(id, "git fetch --depth 1 origin "+sha)
 		if out, err := r.git(ctx, env, "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", sha); err != nil {
-			return "", "", nil, fmt.Errorf("git fetch %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
+			return "", "", "", fmt.Errorf("git fetch %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
 		}
 		if out, err := r.git(ctx, env, "-C", repo, "checkout", "--quiet", "--detach", sha); err != nil {
-			return "", "", nil, fmt.Errorf("git checkout %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
+			return "", "", "", fmt.Errorf("git checkout %s: %v: %s", sha, err, strings.TrimSpace(string(out)))
 		}
 	}
 	head, err := r.git(ctx, env, "-C", repo, "rev-parse", "HEAD")
 	if err != nil {
-		return "", "", nil, fmt.Errorf("git rev-parse: %v", err)
+		return "", "", "", fmt.Errorf("git rev-parse: %v", err)
 	}
 	commit = strings.TrimSpace(string(head))
 	r.Store.SetRunCommit(context.Background(), id, commit)
 	r.note(id, "at commit "+commit)
 
 	if work, err = workDir(repo, p.Path); err != nil {
-		return "", "", nil, err
+		return "", "", "", err
 	}
-	return work, commit, func() { os.RemoveAll(tmp) }, nil
+	return work, commit, tmp, nil
 }
 
 // doPlan plans and saves the plan file. after, when set, reads the plan in
-// the checkout before it's removed.
-func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []string, after func(work string) error) error {
-	work, _, cleanup, err := r.checkout(ctx, id, p, "", env)
+// the checkout, c.Dir, before it's removed.
+func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []string, after func(c *conn3xexec.Conn3x) error) error {
+	work, _, tmp, err := r.checkout(ctx, id, p, "", env)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer os.RemoveAll(tmp)
 
-	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
+	c, err := r.conn3x(id, p, tmp, work, env)
+	if err != nil {
+		return err
+	}
 	r.note(id, "conn3x init -input=false")
 	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
 		return fmt.Errorf("init: %w", err)
@@ -476,9 +487,9 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	if err := copyFile(filepath.Join(work, "plan.bin"), r.PlanFile(id)); err != nil {
 		return err
 	}
-	r.saveFacts(ctx, id, p, work, env)
+	r.saveFacts(ctx, id, p, c)
 	if after != nil {
-		return after(work)
+		return after(c)
 	}
 	return nil
 }
@@ -486,12 +497,15 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 // doDrift refreshes the state against the hosts without planning any
 // change. -detailed-exitcode makes conn3x exit 2 when something drifted.
 func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []string) error {
-	work, _, cleanup, err := r.checkout(ctx, id, p, "", env)
+	work, _, tmp, err := r.checkout(ctx, id, p, "", env)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
-	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
+	defer os.RemoveAll(tmp)
+	c, err := r.conn3x(id, p, tmp, work, env)
+	if err != nil {
+		return err
+	}
 	r.note(id, "conn3x init -input=false")
 	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
 		return fmt.Errorf("init: %w", err)
@@ -511,7 +525,7 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	if err != nil {
 		return fmt.Errorf("plan: %w", err)
 	}
-	r.saveFacts(ctx, id, p, work, env)
+	r.saveFacts(ctx, id, p, c)
 	return r.Store.SetRunOutcome(context.Background(), id, outcome)
 }
 
@@ -519,15 +533,18 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 // plan file. A plan that no longer matches the state is refused by conn3x
 // itself, and that error ends the run.
 func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan store.Run, env []string) error {
-	work, _, cleanup, err := r.checkout(ctx, id, p, plan.CommitSHA, env)
+	work, _, tmp, err := r.checkout(ctx, id, p, plan.CommitSHA, env)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer os.RemoveAll(tmp)
 	if err := copyFile(r.PlanFile(plan.ID), filepath.Join(work, "plan.bin")); err != nil {
 		return fmt.Errorf("plan %d has no saved plan file: %w", plan.ID, err)
 	}
-	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
+	c, err := r.conn3x(id, p, tmp, work, env)
+	if err != nil {
+		return err
+	}
 	r.note(id, "conn3x init -input=false")
 	if err := c.Run(ctx, r.record(id), "init", "-input=false"); err != nil {
 		return fmt.Errorf("init: %w", err)
@@ -537,10 +554,54 @@ func (r *Runner) doApply(ctx context.Context, id int64, p store.Project, plan st
 	}
 	r.note(id, fmt.Sprintf("conn3x apply -input=false -report=report.json plan.bin (plan %d)", plan.ID))
 	// -report doesn't go with -json, so the stream goes to a file instead.
-	if err := c.RunInto(ctx, r.record(id), filepath.Join(work, "stream.json"), "apply", "-input=false", "-report="+r.ReportFile(id), "plan.bin"); err != nil {
-		return fmt.Errorf("apply: %w", err)
+	// The report is written in the checkout, since a sandboxed run can't
+	// write to the data directory, and copied there after, even when the
+	// apply failed part way.
+	applyErr := c.RunInto(ctx, r.record(id), filepath.Join(work, "stream.json"), "apply", "-input=false", "-report=report.json", "plan.bin")
+	if err := copyFile(filepath.Join(work, "report.json"), r.ReportFile(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if applyErr != nil {
+		return fmt.Errorf("apply: %w", applyErr)
 	}
 	return nil
+}
+
+// conn3x is how a run starts conn3x in work. When the runner sandboxes
+// runs, conn3x can write only in tmp, the run's own directory, and read
+// only the system's directories, its credential files and a few of the
+// home directory's settings.
+func (r *Runner) conn3x(id int64, p store.Project, tmp, work string, env []string) (*conn3xexec.Conn3x, error) {
+	c := &conn3xexec.Conn3x{Path: p.Conn3xPath, Dir: work, Env: env, Stderr: noteWriter{r, id}}
+	if !r.Sandbox {
+		return c, nil
+	}
+	prog := p.Conn3xPath
+	if prog == "" {
+		prog = "conn3x"
+	}
+	pol := sandbox.Policy{Write: []string{tmp}}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		switch {
+		case strings.HasPrefix(k, "CONN3X_CRED_"):
+			pol.Read = append(pol.Read, v)
+		case k == "TF_PLUGIN_CACHE_DIR":
+			pol.Write = append(pol.Write, v)
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, f := range []string{".ssh", ".terraform.d", ".terraformrc", ".tofurc"} {
+			pol.Read = append(pol.Read, filepath.Join(home, f))
+		}
+	}
+	path, v, err := sandbox.Command(prog, pol)
+	if err != nil {
+		return nil, err
+	}
+	// Last, so neither wins over the project's own variables' names.
+	c.Path, c.Env = path, append(slices.Clip(env), "TMPDIR="+filepath.Join(tmp, "tmp"), v)
+	return c, nil
 }
 
 // commitSHA is a full SHA-1 or SHA-256 commit ID, all git takes here.

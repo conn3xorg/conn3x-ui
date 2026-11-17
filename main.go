@@ -23,6 +23,7 @@ import (
 
 	"github.com/conn3xorg/conn3x-ui/internal/mail"
 	"github.com/conn3xorg/conn3x-ui/internal/run"
+	"github.com/conn3xorg/conn3x-ui/internal/sandbox"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 	"github.com/conn3xorg/conn3x-ui/internal/web"
 )
@@ -31,6 +32,7 @@ import (
 var version = "dev"
 
 func main() {
+	sandbox.Exec() // returns unless this process is a run's sandboxed conn3x
 	if len(os.Args) == 2 && os.Args[1] == "version" {
 		fmt.Println("conn3x-ui", version)
 		return
@@ -71,12 +73,17 @@ func main() {
 	fs.StringVar(&mc.from, "smtp-from", "", "address drift emails come from")
 	fs.StringVar(&mc.user, "smtp-user", "", "user to sign in to the SMTP server as")
 	fs.StringVar(&mc.passwordFile, "smtp-password-file", "", "file with the SMTP password; or set "+smtpPasswordEnv)
+	sandboxMode := fs.String("sandbox", "auto", "run conn3x away from the UI's data and other runs, with Linux Landlock: on, off, or auto to when the kernel has it")
 	fs.Parse(os.Args[2:])
 	mailer, err := mc.mailer()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := serve(*listen, *data, *keyFile, *publicURL, oc, mailer, *retention); err != nil {
+	sandboxed, err := sandboxRuns(*sandboxMode)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := serve(*listen, *data, *keyFile, *publicURL, oc, mailer, *retention, sandboxed); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -232,7 +239,7 @@ func (mc mailConfig) mailer() (*mail.Mailer, error) {
 	return &mail.Mailer{Addr: mc.addr, From: from[0], User: mc.user, Password: pw}, nil
 }
 
-func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.Mailer, retention time.Duration) error {
+func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.Mailer, retention time.Duration, sandboxed bool) error {
 	if publicURL != "" {
 		if u, err := url.Parse(publicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("-public-url must be an http or https URL, such as https://conn3x.example.com")
@@ -293,6 +300,7 @@ func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.
 	runner := run.New(ctx, st, data)
 	runner.PublicURL = publicURL
 	runner.Retention = retention
+	runner.Sandbox = sandboxed
 	if mailer != nil { // a nil *Mailer in the interface would look set
 		runner.Mailer = mailer
 	}
@@ -319,4 +327,26 @@ func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.
 	<-scheduled   // so no drift check starts after Wait
 	runner.Wait() // conn3x got the interrupt too; let it release its locks
 	return nil
+}
+
+// sandboxRuns says whether runs are sandboxed, for -sandbox's mode, and
+// logs it.
+func sandboxRuns(mode string) (bool, error) {
+	switch mode {
+	case "off":
+		log.Print("runs aren't sandboxed (-sandbox=off): a run can read the UI's data")
+		return false, nil
+	case "on", "auto":
+		v, err := sandbox.Available()
+		if err == nil {
+			log.Printf("runs are sandboxed with Landlock ABI %d", v)
+			return true, nil
+		}
+		if mode == "on" {
+			return false, fmt.Errorf("-sandbox=on, but runs can't be sandboxed: %v", err)
+		}
+		log.Printf("runs aren't sandboxed, so a run can read the UI's data: Landlock: %v", err)
+		return false, nil
+	}
+	return false, fmt.Errorf("-sandbox is on, off or auto, not %q", mode)
 }

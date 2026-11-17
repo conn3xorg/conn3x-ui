@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 
+	conn3xexec "github.com/conn3xorg/conn3x-exec"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
 
@@ -131,10 +132,10 @@ func withoutSensitive(v, sens any) any {
 	return v
 }
 
-// saveFacts stores the facts in the plan saved in work, for the fleet
+// saveFacts stores the facts in the plan saved in c.Dir, for the fleet
 // store. Not being able to doesn't fail the run; its log says why.
-func (r *Runner) saveFacts(ctx context.Context, id int64, p store.Project, work string, env []string) {
-	b, err := showJSON(ctx, p.Conn3xPath, work, env)
+func (r *Runner) saveFacts(ctx context.Context, id int64, p store.Project, c *conn3xexec.Conn3x) {
+	b, err := showJSON(ctx, c.Path, c.Dir, c.Env)
 	var facts map[string]map[string]map[string]any
 	if err == nil {
 		facts, err = planFacts(b)
