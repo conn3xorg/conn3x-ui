@@ -152,7 +152,7 @@ func (r *Runner) correct(driftID int64, p store.Project) {
 
 // notifyScheduled posts what a scheduled plan or apply came to.
 func (r *Runner) notifyScheduled(p store.Project, id int64, status, outcome, text string) {
-	if p.WebhookURL == "" {
+	if p.WebhookURL == "" && (p.NotifyEmail == "" || r.Mailer == nil) {
 		return
 	}
 	var hosts []string
@@ -168,7 +168,5 @@ func (r *Runner) notifyScheduled(p store.Project, id int64, status, outcome, tex
 	}
 	n := Notification{Project: p.Name, RunID: id, Status: status, Outcome: outcome, Link: fmt.Sprintf("/runs/%d", id), Hosts: hosts, Time: time.Now().UTC(), Text: text}
 	r.withURL(&n)
-	if err := postWebhook(p.WebhookURL, n); err != nil {
-		r.Log.Printf("run %d: webhook: %v", id, err)
-	}
+	r.deliver(p, n)
 }

@@ -5,6 +5,7 @@ package run
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/conn3xorg/conn3x-ui/internal/mail"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
 
@@ -223,7 +225,7 @@ var webhookClient = &http.Client{Timeout: 10 * time.Second}
 // or failed. A webhook that fails is logged, without its URL, and the run
 // stands as it ended.
 func (r *Runner) notify(id int64, p store.Project) {
-	if p.WebhookURL == "" {
+	if p.WebhookURL == "" && (p.NotifyEmail == "" || r.Mailer == nil) {
 		return
 	}
 	bg := context.Background()
@@ -247,8 +249,32 @@ func (r *Runner) notify(id int64, p store.Project) {
 		n.Text = fmt.Sprintf("Conn3x: %s drifted on %s (run %d)", p.Name, strings.Join(n.Hosts, ", "), id)
 	}
 	r.withURL(&n)
-	if err := postWebhook(p.WebhookURL, n); err != nil {
-		r.Log.Printf("run %d: webhook: %v", id, err)
+	r.deliver(p, n)
+}
+
+// deliver sends n to p's webhook and to its email addresses, whichever it
+// has. A failure is logged, never with the webhook's URL, and the run
+// stands as it ended.
+func (r *Runner) deliver(p store.Project, n Notification) {
+	if p.WebhookURL != "" {
+		if err := postWebhook(p.WebhookURL, n); err != nil {
+			r.Log.Printf("run %d: webhook: %v", n.RunID, err)
+		}
+	}
+	if p.NotifyEmail == "" || r.Mailer == nil {
+		return
+	}
+	to, err := mail.ParseAddresses(p.NotifyEmail)
+	if err == nil {
+		body := n.Text + "\n"
+		if len(n.Hosts) > 0 {
+			body += "\nHosts: " + strings.Join(n.Hosts, ", ") + "\n"
+		}
+		body += "\nRun " + strconv.FormatInt(n.RunID, 10) + ": " + cmp.Or(n.URL, n.Link) + "\n"
+		err = r.Mailer.Send(to, n.Text, body)
+	}
+	if err != nil {
+		r.Log.Printf("run %d: email: %v", n.RunID, err)
 	}
 }
 

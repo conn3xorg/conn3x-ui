@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/conn3xorg/conn3x-ui/internal/mail"
 	"github.com/conn3xorg/conn3x-ui/internal/run"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 	"github.com/conn3xorg/conn3x-ui/internal/web"
@@ -45,7 +47,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-public-url URL] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
+		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-public-url URL] [-smtp-addr HOST:PORT -smtp-from ADDR ...] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -60,8 +62,17 @@ func main() {
 	fs.StringVar(&oc.emailDomain, "oidc-email-domain", "", "only let in OIDC users with a verified email in this domain")
 	fs.BoolVar(&oc.noPassword, "no-password-sign-in", false, "turn off sign-in with a password, once a site admin signs in with OIDC")
 	publicURL := fs.String("public-url", "", "this UI's address, such as https://conn3x.example.com, for full links in webhooks")
+	var mc mailConfig
+	fs.StringVar(&mc.addr, "smtp-addr", "", "SMTP server, host:port, for drift emails; STARTTLS is required except on loopback")
+	fs.StringVar(&mc.from, "smtp-from", "", "address drift emails come from")
+	fs.StringVar(&mc.user, "smtp-user", "", "user to sign in to the SMTP server as")
+	fs.StringVar(&mc.passwordFile, "smtp-password-file", "", "file with the SMTP password; or set "+smtpPasswordEnv)
 	fs.Parse(os.Args[2:])
-	if err := serve(*listen, *data, *keyFile, *publicURL, oc); err != nil {
+	mailer, err := mc.mailer()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := serve(*listen, *data, *keyFile, *publicURL, oc, mailer); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -164,7 +175,38 @@ func rotateKey(data, oldFile, newFile string) error {
 	return nil
 }
 
-func serve(listen, data, keyFile, publicURL string, oc oidcConfig) error {
+// smtpPasswordEnv holds the SMTP password when -smtp-password-file doesn't.
+const smtpPasswordEnv = "CONN3X_UI_SMTP_PASSWORD"
+
+type mailConfig struct{ addr, from, user, passwordFile string }
+
+// mailer is the Mailer the flags describe, or nil without -smtp-addr. The
+// password comes from its file, or from the environment, which it's taken
+// out of so no run inherits it.
+func (mc mailConfig) mailer() (*mail.Mailer, error) {
+	pw := os.Getenv(smtpPasswordEnv)
+	os.Unsetenv(smtpPasswordEnv)
+	if mc.addr == "" {
+		return nil, nil
+	}
+	if _, _, err := net.SplitHostPort(mc.addr); err != nil {
+		return nil, fmt.Errorf("-smtp-addr must be host:port: %w", err)
+	}
+	from, err := mail.ParseAddresses(mc.from)
+	if err != nil || len(from) != 1 {
+		return nil, errors.New("-smtp-addr needs -smtp-from, one email address")
+	}
+	if mc.passwordFile != "" {
+		b, err := os.ReadFile(mc.passwordFile)
+		if err != nil {
+			return nil, err
+		}
+		pw = strings.TrimRight(string(b), "\r\n")
+	}
+	return &mail.Mailer{Addr: mc.addr, From: from[0], User: mc.user, Password: pw}, nil
+}
+
+func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.Mailer) error {
 	if publicURL != "" {
 		if u, err := url.Parse(publicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("-public-url must be an http or https URL, such as https://conn3x.example.com")
@@ -224,6 +266,9 @@ func serve(listen, data, keyFile, publicURL string, oc oidcConfig) error {
 	}
 	runner := run.New(ctx, st, data)
 	runner.PublicURL = publicURL
+	if mailer != nil { // a nil *Mailer in the interface would look set
+		runner.Mailer = mailer
+	}
 	if n, err := runner.RemoveLeftovers(); err != nil {
 		return err
 	} else if n > 0 {

@@ -1103,3 +1103,53 @@ func TestCheckDriftNow(t *testing.T) {
 		t.Errorf("run page doesn't name who started it:\n%s", page)
 	}
 }
+
+// fakeMailer keeps what it's asked to send.
+type fakeMailer struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (m *fakeMailer) Send(to []string, subject, body string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, strings.Join(to, ",")+"|"+subject+"|"+body)
+	return nil
+}
+
+// A project's drift email gets what its webhook would; a bad address is
+// refused when the project is saved.
+func TestDriftEmail(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	m := &fakeMailer{}
+	e.runner.Mailer = m
+	e.runner.PublicURL = "https://conn3x.example.com"
+	ctx := context.Background()
+	pid, err := e.st.CreateProject(ctx, store.Project{Name: "web", GitURL: repo, GitRef: "main", Path: ".", Conn3xPath: exe, Env: "CONN3X_FAKE=drift",
+		Schedule: "1h", NotifyEmail: "ops@example.com, oncall@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.runner.Tick(ctx, time.Now().Add(2*time.Hour))
+	e.runner.Wait()
+	rn, err := e.st.LastRun(ctx, pid, store.KindDrift)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("ops@example.com,oncall@example.com|Conn3x: web drifted on web1 (run %d): https://conn3x.example.com/runs/%d|", rn.ID, rn.ID)
+	if len(m.sent) != 1 || !strings.HasPrefix(m.sent[0], want) || !strings.Contains(m.sent[0], "Hosts: web1") {
+		t.Errorf("sent %q", m.sent)
+	}
+
+	e.login(t)
+	project := fmt.Sprintf("/projects/%d", pid)
+	if _, page := e.get(project); !strings.Contains(page, `value="ops@example.com, oncall@example.com"`) {
+		t.Errorf("form doesn't show the addresses:\n%s", page)
+	}
+	form := url.Values{"csrf": {e.csrf(project)}, "name": {"web"}, "git_url": {repo}, "conn3x_path": {exe}, "env": {"CONN3X_FAKE=drift"}, "notify_email": {"ops@example.com, nope"}}
+	if resp, body := e.postBody(project, form); resp.StatusCode != 400 || !strings.Contains(body, "isn&#39;t an email address") {
+		t.Errorf("bad address: %d\n%s", resp.StatusCode, body)
+	}
+}
