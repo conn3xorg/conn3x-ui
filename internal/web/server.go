@@ -6,6 +6,7 @@
 package web
 
 import (
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"embed"
@@ -371,6 +372,16 @@ func projectForm(r *http.Request) (store.Project, error) {
 		}
 	}
 	p.SelfApply = r.PostFormValue("self_apply") != ""
+	switch p.ScheduleMode = f("schedule_mode", store.ModeReport); p.ScheduleMode {
+	case store.ModeReport, store.ModeCorrect, store.ModeConverge:
+	default:
+		return p, errors.New("that isn't something a drift check can do")
+	}
+	n, err := strconv.Atoi(f("max_changes", "0"))
+	if err != nil || n < 0 {
+		return p, errors.New("the most changes a schedule may apply is a whole number, 0 for no limit")
+	}
+	p.MaxChanges = n
 	return p, nil
 }
 
@@ -441,6 +452,9 @@ func (s *Server) auditSchedule(r *http.Request, p, old, saved store.Project) {
 	if old.Schedule != saved.Schedule {
 		s.audit(r.Context(), sess(r).user, p, "schedule change", fmt.Sprintf("%q to %q", old.Schedule, saved.Schedule))
 	}
+	if was := cmp.Or(old.ScheduleMode, store.ModeReport); was != saved.ScheduleMode || old.MaxChanges != saved.MaxChanges {
+		s.audit(r.Context(), sess(r).user, p, "schedule mode change", fmt.Sprintf("%s, at most %d changes, to %s, at most %d", was, old.MaxChanges, saved.ScheduleMode, saved.MaxChanges))
+	}
 	if old.WebhookURL != saved.WebhookURL {
 		detail := "removed"
 		if saved.WebhookURL != "" {
@@ -466,6 +480,11 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 	// admin may change it.
 	if err == nil && !sess(r).user.Admin && (form.GitURL != p.GitURL || form.Conn3xPath != p.Conn3xPath || form.Env != p.Env) {
 		err = errors.New("only a site admin can change the Git URL, the Conn3x binary or the environment variables")
+	}
+	// The mode and its limit let the schedule change hosts with nobody
+	// approving, so they're a site admin's call too.
+	if err == nil && !sess(r).user.Admin && (form.ScheduleMode != p.ScheduleMode || form.MaxChanges != p.MaxChanges) {
+		err = errors.New("only a site admin can change what a drift check does about drift, or how many changes it may apply")
 	}
 	if err == nil {
 		err = s.Store.UpdateProject(r.Context(), form)

@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -80,7 +81,9 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
-	fmt.Fprintln(out, versionLine)
+	if os.Args[1] != "show" { // show -json prints the plan alone
+		fmt.Fprintln(out, versionLine)
+	}
 	switch os.Args[1] {
 	case "init":
 		if mode != "local" {
@@ -89,7 +92,7 @@ func TestMain(m *testing.M) {
 		}
 	case "plan":
 		if slices.Contains(os.Args, "-refresh-only") {
-			if mode == "drift" {
+			if strings.HasPrefix(mode, "drift") {
 				fmt.Println(strings.Replace(changeLine("web1", "build", "update"), "planned_change", "resource_drift", 1))
 				if slices.Contains(os.Args, "-detailed-exitcode") {
 					os.Exit(2)
@@ -125,6 +128,15 @@ func TestMain(m *testing.M) {
 				os.WriteFile(out, []byte("plan"), 0o644)
 			}
 		}
+	case "show":
+		// The saved plan, as conn3x show -json gives it: in "driftfix" only
+		// web1's build changes, putting back what drifted; otherwise also two
+		// creates.
+		changes := `{"address":"conn3x_command.web__build[\"web1\"]","change":{"actions":["update"]}},{"address":"conn3x_command.web__build[\"web3\"]","change":{"actions":["no-op"]}}`
+		if mode != "driftfix" {
+			changes += `,{"address":"conn3x_command.web__build[\"web2\"]","change":{"actions":["create"]}},{"address":"conn3x_command.web__deploy[\"web1\"]","change":{"actions":["create"]}}`
+		}
+		fmt.Printf(`{"format_version":"1.2","resource_changes":[%s],"resource_drift":[{"address":"conn3x_command.web__build[\"web1\"]"}]}`+"\n", changes)
 	case "apply":
 		if b, err := os.ReadFile(os.Args[len(os.Args)-1]); err != nil || string(b) != "plan" {
 			fmt.Fprintf(out, `{"@level":"error","@message":"Error: no plan file","type":"diagnostic","diagnostic":{"severity":"error","summary":"no plan file","detail":%q}}`+"\n", fmt.Sprint(os.Args, err))
@@ -941,5 +953,103 @@ func TestDriftSettings(t *testing.T) {
 	}
 	if resp := e.post(project, url.Values{"name": {"web"}, "git_url": {"https://example.com/r.git"}, "schedule": {"1h"}}); resp.StatusCode != 403 {
 		t.Errorf("save without CSRF: %d", resp.StatusCode)
+	}
+}
+
+// A drift check that finds drift, in a project that corrects or converges,
+// plans, and applies that plan with no one approving it only when the plan
+// passes the guards. Otherwise the plan waits, and the webhook says why.
+func TestScheduledApply(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	var mu sync.Mutex
+	got := map[string][]run.Notification{}
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n run.Notification
+		json.NewDecoder(r.Body).Decode(&n)
+		mu.Lock()
+		got[n.Project] = append(got[n.Project], n)
+		mu.Unlock()
+	}))
+	defer hook.Close()
+	ctx := context.Background()
+	add := func(name, fake, mode string, max int) int64 {
+		id, err := e.st.CreateProject(ctx, store.Project{Name: name, GitURL: repo, GitRef: "main", Path: ".", Conn3xPath: exe, Env: "CONN3X_FAKE=" + fake,
+			Schedule: "1h", WebhookURL: hook.URL, ScheduleMode: mode, MaxChanges: max})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	fix := add("fix", "driftfix", store.ModeCorrect, 0)
+	wide := add("wide", "driftwide", store.ModeCorrect, 0)
+	converge := add("converge", "driftwide", store.ModeConverge, 0)
+	capped := add("capped", "driftwide", store.ModeConverge, 2)
+	report := add("report", "driftfix", store.ModeReport, 0)
+
+	e.runner.Tick(ctx, time.Now().Add(2*time.Hour))
+	e.runner.Wait()
+
+	applied := func(pid int64) (store.Run, bool) {
+		t.Helper()
+		rn, err := e.st.LastRun(ctx, pid, store.KindApply)
+		if errors.Is(err, store.ErrNotFound) {
+			return rn, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rn, true
+	}
+	planOf := func(pid int64) store.Run {
+		t.Helper()
+		rn, err := e.st.LastRun(ctx, pid, store.KindPlan)
+		if err != nil {
+			t.Fatalf("project %d has no plan: %v", pid, err)
+		}
+		return rn
+	}
+	for name, pid := range map[string]int64{"fix": fix, "converge": converge} {
+		a, ok := applied(pid)
+		if !ok || a.Status != store.StatusSucceeded || !a.BySchedule || a.ApprovedBy.Valid || a.PlanRunID.Int64 != planOf(pid).ID || !planOf(pid).BySchedule {
+			t.Errorf("%s: apply %+v, %v", name, a, ok)
+		}
+		if ns := got[name]; len(ns) != 2 || ns[0].Outcome != "drift" || ns[1].Outcome != "corrected" || ns[1].RunID != a.ID {
+			t.Errorf("%s: notifications %+v", name, ns)
+		}
+	}
+	for name, c := range map[string]struct {
+		pid  int64
+		want string
+	}{
+		"wide":   {wide, "correcting drift only updates in place"},
+		"capped": {capped, "makes 3 changes, more than the 2"},
+	} {
+		if a, ok := applied(c.pid); ok {
+			t.Errorf("%s applied: %+v", name, a)
+		}
+		ns := got[name]
+		if len(ns) != 2 || ns[1].Outcome != "waiting" || ns[1].RunID != planOf(c.pid).ID || !strings.Contains(ns[1].Text, c.want) {
+			t.Errorf("%s: notifications %+v", name, ns)
+		}
+		// A person can still apply the plan that waits.
+		if ok, err := e.st.Applicable(ctx, planOf(c.pid).ID); err != nil || !ok {
+			t.Errorf("%s: plan not applicable: %v", name, err)
+		}
+	}
+	if _, err := e.st.LastRun(ctx, report, store.KindPlan); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("report mode planned: %v", err)
+	}
+
+	e.login(t)
+	a, _ := applied(fix)
+	_, body := e.get(fmt.Sprintf("/runs/%d", a.ID))
+	if !strings.Contains(body, "started by the schedule") || !strings.Contains(body, "approved by the schedule") {
+		t.Errorf("apply page:\n%s", body)
+	}
+	_, body = e.get(fmt.Sprintf("/runs/%d", planOf(wide).ID))
+	if !strings.Contains(body, "Waits for a person to approve") {
+		t.Errorf("waiting plan page:\n%s", body)
 	}
 }

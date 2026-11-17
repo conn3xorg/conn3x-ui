@@ -19,13 +19,13 @@
 <div id="status" {{if not .Data.Run.Finished}}hx-get="/runs/{{.Data.Run.ID}}/status" hx-trigger="every 2s, refresh" hx-swap="outerHTML"{{end}}>
   <p>
     <span class="status {{.Data.Run.Status}}">{{.Data.Run.Status}}</span>{{with .Data.Run.Outcome}} · <span class="status {{.}}">{{.}}</span>{{end}}
-    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else if eq .Data.Run.Kind "drift"}}the schedule{{else}}a removed user{{end}}
+    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else if .Data.Run.BySchedule}}the schedule{{else}}a removed user{{end}}
     {{if .Data.Run.CommitSHA}} · commit <span class="act">{{printf "%.10s" .Data.Run.CommitSHA}}</span>{{end}}
     {{if .Data.Run.Conn3xVersion}} · Conn3x {{.Data.Run.Conn3xVersion}}{{end}}
     {{if .Data.Run.StartedAt.Valid}} · started {{.Data.Run.StartedAt.String}}{{end}}
     {{if .Data.Run.FinishedAt.Valid}} · finished {{.Data.Run.FinishedAt.String}}{{end}}
   </p>
-  {{if .Data.Run.PlanRunID.Valid}}<p>Applies <a href="/runs/{{.Data.Run.PlanRunID.Int64}}">plan {{.Data.Run.PlanRunID.Int64}}</a>{{if .Data.Run.ApprovedAt.Valid}}, approved by {{if .Data.Run.ApprovedByName.Valid}}{{.Data.Run.ApprovedByName.String}}{{else}}a removed user{{end}} at {{.Data.Run.ApprovedAt.String}}{{end}}.</p>{{end}}
+  {{if .Data.Run.PlanRunID.Valid}}<p>Applies <a href="/runs/{{.Data.Run.PlanRunID.Int64}}">plan {{.Data.Run.PlanRunID.Int64}}</a>{{if .Data.Run.ApprovedAt.Valid}}, approved by {{if .Data.Run.ApprovedByName.Valid}}{{.Data.Run.ApprovedByName.String}}{{else if .Data.Run.BySchedule}}the schedule{{else}}a removed user{{end}} at {{.Data.Run.ApprovedAt.String}}{{end}}.</p>{{end}}
   {{if .Data.CanCancel}}
   <form method="post" action="/runs/{{.Data.Run.ID}}/cancel" style="display:inline">
     <input type="hidden" name="csrf" value="{{.CSRF}}">

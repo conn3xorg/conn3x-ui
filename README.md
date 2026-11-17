@@ -145,6 +145,26 @@ When a check is due, the UI queues it like any other run, so one run at a time p
 
 When is a check due? One interval, or the next cron slot, after the last check started. That survives a restart: a UI that was down past a slot runs the check once when it starts, not once for every slot it missed. A project's first check comes one slot after the schedule was saved.
 
+### Putting drift back
+
+A check can do more than report. **When a check finds drift**, in a project's settings, has three choices:
+
+| Choice | What happens after a check finds drift |
+| --- | --- |
+| **Report it** (the default) | Nothing more. The check's run says what drifted. |
+| **Correct it** | The UI plans, and applies that plan only when every change in it is an in-place update of something the same plan saw drift. |
+| **Converge** | The UI plans, and applies any plan with no delete or replace in it, the way an agent that keeps hosts converged would. |
+
+Whichever you pick, the plan is the same plan-then-apply-that-plan a person runs, and it shows in **Runs** as started, and approved, by the schedule. Some plans always wait for a person, in either mode:
+
+- **A delete or a replace.** The schedule never removes anything.
+- **More changes than the limit.** Set **Most changes a schedule may apply** and a plan over it waits. Forty hosts drifting at once is more likely a mistake upstream than forty broken servers.
+- **When correcting, anything that isn't putting back drift.** A create, or an update to something that didn't drift, means the configuration changed, and that's for a person to approve.
+
+A plan that waits is an ordinary plan: an approver can apply it from its run page. `confirm_after` steps work as they do by hand, so a scheduled firewall change that locks Conn3x out still undoes itself.
+
+Only a site admin can pick **Correct** or **Converge**, or change the limit. Either lets the schedule change hosts with nobody approving, so anyone who can push to the project's repository can then change its hosts without review.
+
 Add a **drift webhook** to hear about it. When a check finds drift, or fails, the UI POSTs this, with a 10-second timeout:
 
 ```json
@@ -161,6 +181,8 @@ Add a **drift webhook** to hear about it. When a check finds drift, or fails, th
 ```
 
 `link` is the run's path on the UI; put your UI's address in front. `text` is a one-line summary, for chat webhooks that read a `text` field. A failed check has `"status": "failed"` and an empty `outcome`. If the webhook fails, the log says so and the run stands as it ended.
+
+When a check corrects or converges, the webhook hears twice: once for the drift, and once for what came of it. A plan that waits has `"outcome": "waiting"`, its `run_id` is the plan's, and `text` says why it waits. An apply the schedule made has `"outcome": "corrected"` when it succeeds, or its `status` when it doesn't. A plan that found nothing to change sends nothing more.
 
 The URL must be `http://` or `https://`. Webhook URLs often carry a token, so once saved the page shows only the host, and the log never prints it. Leave the field blank to keep the saved one, or tick **Remove the webhook**.
 

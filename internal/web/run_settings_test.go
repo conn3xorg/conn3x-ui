@@ -66,6 +66,32 @@ func TestRunSettingsNeedASiteAdmin(t *testing.T) {
 	if p := saved(); p.Schedule != "6h" {
 		t.Errorf("schedule = %q", p.Schedule)
 	}
+	// So is what a drift check does about drift, which lets the schedule
+	// change hosts with nobody approving, and its limit.
+	for field, value := range map[string]string{"schedule_mode": store.ModeConverge, "max_changes": "5"} {
+		resp, body := padmin.postBody(project, form(padmin, map[string]string{field: value}))
+		if resp.StatusCode != 400 || !strings.Contains(body, "only a site admin can change what a drift check does") {
+			t.Errorf("project admin changing %s: %d\n%s", field, resp.StatusCode, body)
+		}
+	}
+	if _, page := padmin.get(project); strings.Contains(page, `<select id="schedule_mode"`) || !strings.Contains(page, "Report it, and change nothing.") {
+		t.Errorf("project admin's form offers the schedule mode:\n%s", page)
+	}
+	if resp := e.post(project, form(e.client, map[string]string{"schedule_mode": store.ModeCorrect, "max_changes": "5"})); resp.StatusCode != 303 {
+		t.Errorf("site admin setting the schedule mode: %d", resp.StatusCode)
+	}
+	if p := saved(); p.ScheduleMode != store.ModeCorrect || p.MaxChanges != 5 {
+		t.Errorf("schedule mode = %q, %d", p.ScheduleMode, p.MaxChanges)
+	}
+	// The project admin's form carries the saved mode back unchanged.
+	if resp := padmin.post(project, form(padmin, map[string]string{"schedule_mode": store.ModeCorrect, "max_changes": "5", "schedule": "12h"})); resp.StatusCode != 303 {
+		t.Errorf("project admin saving with the mode unchanged: %d", resp.StatusCode)
+	}
+	if resp, _ := e.postBody(project, form(e.client, map[string]string{"schedule_mode": "yolo"})); resp.StatusCode != 400 {
+		t.Errorf("an unknown mode: %d", resp.StatusCode)
+	}
+	e.post(project, form(e.client, map[string]string{"schedule_mode": store.ModeReport, "max_changes": "0"}))
+
 	// A site admin changes any of it.
 	if resp := e.post(project, form(e.client, map[string]string{"git_url": other, "env": "CONN3X_FAKE=plan\nAWS_PROFILE=prod"})); resp.StatusCode != 303 {
 		t.Errorf("site admin changing the run settings: %d", resp.StatusCode)
