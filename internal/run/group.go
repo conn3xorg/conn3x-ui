@@ -43,7 +43,10 @@ type Step struct {
 // "ok" or "failed" for an apply, with how long the step took, and "" for
 // a plan. Host is set for drift, which isn't grouped by host.
 type Action struct {
-	Host    string
+	Host string
+	// Step is the circuit step, "circuit.step", or "" for a resource that
+	// isn't one.
+	Step    string
 	Addr    string
 	Item    string
 	Action  string
@@ -86,6 +89,28 @@ func (r Result) HostOutcomes() map[string]string {
 	for _, h := range r.Hosts {
 		if h.Name != "" {
 			out[h.Name] = h.Outcome()
+		}
+	}
+	return out
+}
+
+// StepResults are the run's results for the fleet store: each step applied
+// on each host, with its outcome, and each step that drifted.
+func (r Result) StepResults() []store.StepResult {
+	var out []store.StepResult
+	for _, h := range r.Hosts {
+		for _, s := range h.Steps {
+			for _, a := range s.Actions {
+				if h.Name == "" || a.Outcome == "" {
+					continue // a plan's actions, or a resource that isn't a step
+				}
+				out = append(out, store.StepResult{Host: h.Name, Step: s.Name, Item: a.Item, Kind: store.ResultApplied, Action: a.Action, Outcome: a.Outcome, Elapsed: a.Elapsed})
+			}
+		}
+	}
+	for _, a := range r.Drift {
+		if a.Host != "" && a.Step != "" {
+			out = append(out, store.StepResult{Host: a.Host, Step: a.Step, Item: a.Item, Kind: store.ResultDrift, Action: a.Action})
 		}
 	}
 	return out
@@ -159,8 +184,8 @@ func Group(lines [][]byte) Result {
 			if ev.Type == "apply_errored" {
 				a.Outcome = "failed"
 			}
-			if ev.Hook.Resource.Step != nil {
-				a.Item = ev.Hook.Resource.Step.Item
+			if st := ev.Hook.Resource.Step; st != nil {
+				a.Item, a.Step = st.Item, st.Circuit+"."+st.Step
 			}
 			add(ev.Hook.Resource, a)
 		}
@@ -181,8 +206,8 @@ func Group(lines [][]byte) Result {
 
 func action(c *conn3xexec.Change) Action {
 	a := Action{Addr: c.Resource.Addr, Action: c.Action, Reason: c.Reason}
-	if c.Resource.Step != nil {
-		a.Host, a.Item = c.Resource.Step.Host, c.Resource.Step.Item
+	if st := c.Resource.Step; st != nil {
+		a.Host, a.Item, a.Step = st.Host, st.Item, st.Circuit+"."+st.Step
 	}
 	return a
 }

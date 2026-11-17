@@ -111,6 +111,9 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /account/password", s.changePassword)
 	s.mux.HandleFunc("GET /audit", s.auditPage)
 	s.mux.HandleFunc("GET /audit/export", s.auditExport)
+	s.mux.HandleFunc("GET /api/v1/hosts", s.apiHosts)
+	s.mux.HandleFunc("GET /api/v1/hosts/{host}/changes", s.apiHostChanges)
+	s.mux.HandleFunc("GET /api/v1/steps", s.apiSteps)
 	return s
 }
 
@@ -134,6 +137,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess, err := s.session(r)
+	if err != nil && strings.HasPrefix(r.URL.Path, "/api/") {
+		apiError(w, http.StatusUnauthorized, "sign in first")
+		return
+	}
 	if err != nil {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return

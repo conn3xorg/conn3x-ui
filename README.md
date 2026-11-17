@@ -198,6 +198,28 @@ CONN3X_UI_SMTP_PASSWORD=... ./conn3x-ui serve -smtp-addr smtp.example.com:587 -s
 
 The UI only sends mail over STARTTLS, except to a server on loopback, such as a local relay. `-smtp-password-file` takes the password from a file instead, and the UI takes the variable out of its environment once it's read. A mail that can't be sent is logged, and the run stands as it ended.
 
+## The fleet store
+
+"Which hosts run Rocky Linux 10?" and "what changed on db3 last Tuesday?" shouldn't mean reading run logs. The UI keeps the answers as runs finish:
+
+- **Step results.** Every step an apply ran on every host, with its outcome and how long it took, and every step a drift check or plan found drifted.
+- **Facts.** The latest of what each project's `conn3x_host`, `conn3x_packages` and `conn3x_services` data sources read about each host, from every plan and drift check. How a fact was read, such as the `ssh` block, isn't kept, and neither is anything the plan marks sensitive.
+
+Ask it over a read-only JSON API, signed in as yourself; you see only the projects you can view:
+
+```sh
+# Hosts that run Rocky Linux and have openssl installed
+curl -b session=... 'https://conn3x.example.com/api/v1/hosts?fact=os_id:rocky&fact=packages:openssl'
+# What was applied to db3, or drifted there, since Tuesday
+curl -b session=... 'https://conn3x.example.com/api/v1/hosts/db3/changes?since=2026-11-10'
+# Steps of the hardening circuit that failed
+curl -b session=... 'https://conn3x.example.com/api/v1/steps?circuit=hardening&outcome=failed'
+```
+
+A `fact=name:value` matches a fact's value, or one key of a map, which is how `packages:openssl` finds a package. Results come newest first, at most 1,000 at a time, with `"truncated": true` when there are more. Step results are kept for 90 days, `-fleet-retention` to change it; the latest facts per host are kept for good.
+
+The facts are what the circuits read: for a package list, the project's circuit needs a `data "conn3x_packages"` with `for_each` over its hosts.
+
 ## Trust model
 
 Every run executes a project's circuit on this server, as the user the UI runs as. A circuit can run commands on the machine that plans it, for example through an `external` data source, and that user can read the UI's database and its credentials key. So:

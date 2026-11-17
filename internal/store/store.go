@@ -155,6 +155,33 @@ var migrations = []string{
 	// 11: which roles came from a user's OIDC groups, so a sign-in can
 	// change them without touching the ones an admin gave by hand.
 	`ALTER TABLE roles ADD COLUMN from_group INTEGER NOT NULL DEFAULT 0;`,
+	// 12: the fleet store: each step's result on each host, from applies
+	// and drift checks, and the latest facts each project's data sources
+	// read about each host.
+	`CREATE TABLE step_results (
+		id INTEGER PRIMARY KEY,
+		run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		host TEXT NOT NULL,
+		step TEXT NOT NULL,
+		item TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		action TEXT NOT NULL,
+		outcome TEXT NOT NULL,
+		elapsed REAL NOT NULL,
+		at TEXT NOT NULL
+	);
+	CREATE INDEX step_results_host ON step_results(host, at);
+	CREATE INDEX step_results_at ON step_results(at);
+	CREATE TABLE host_facts (
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		host TEXT NOT NULL,
+		source TEXT NOT NULL,
+		facts TEXT NOT NULL,
+		run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+		at TEXT NOT NULL,
+		PRIMARY KEY (project_id, host, source)
+	);`,
 }
 
 // Store is the database.
