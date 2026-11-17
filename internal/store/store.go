@@ -1155,6 +1155,27 @@ type AuditFilter struct {
 	ProjectID int64
 }
 
+// AuditEach calls fn with each entry that matches f and comes after the
+// entry with ID after, oldest first, for an export.
+func (s *Store) AuditEach(ctx context.Context, f AuditFilter, after int64, fn func(Entry) error) error {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, at, COALESCE(user_id, 0), user_name, COALESCE(project_id, 0), project_name, action, detail FROM audit "+
+		"WHERE (?1 = 0 OR user_id = ?1) AND (?2 = 0 OR project_id = ?2) AND id > ?3 ORDER BY id", f.UserID, f.ProjectID, after)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.At, &e.UserID, &e.UserName, &e.ProjectID, &e.ProjectName, &e.Action, &e.Detail); err != nil {
+			return err
+		}
+		if err := fn(e); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // AuditLog returns the entries that match f, newest first, skipping the
 // first offset and returning at most limit.
 func (s *Store) AuditLog(ctx context.Context, f AuditFilter, limit, offset int) ([]Entry, error) {
