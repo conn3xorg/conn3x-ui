@@ -441,7 +441,7 @@ func (s *Server) projectPage(w http.ResponseWriter, r *http.Request, p, form sto
 		s.fail(w, err)
 		return
 	}
-	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey(), "HasMail": s.Runner.Mailer != nil}
+	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey(), "HasMail": s.Runner != nil && s.Runner.Mailer != nil}
 	if store.RoleAtLeast(role, store.RoleAdmin) {
 		if d["Credentials"], err = s.Store.Credentials(r.Context(), p.ID); err == nil {
 			if d["Members"], err = s.Store.Members(r.Context(), p.ID); err == nil {
