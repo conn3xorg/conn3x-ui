@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -161,12 +162,34 @@ func (r *Runner) Tick(ctx context.Context, now time.Time) {
 			r.Log.Printf("schedule: project %d: %v", p.ID, err)
 			continue
 		}
-		if due {
-			if _, err := r.StartDrift(ctx, p); err != nil {
+		if due && r.splay(p, now) {
+			if _, err := r.StartDrift(ctx, p, 0); err != nil {
 				r.Log.Printf("schedule: project %d: %v", p.ID, err)
 			}
 		}
 	}
+}
+
+// splay says whether a due check of p should start at now. With a splay,
+// the first time it's due picks a random delay up to that many minutes,
+// fresh each time, so projects on the same schedule don't all start at
+// once; the check starts once the delay has passed.
+func (r *Runner) splay(p store.Project, now time.Time) bool {
+	if p.SplayMinutes <= 0 {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	at, ok := r.splayed[p.ID]
+	if !ok {
+		at = now.Add(time.Duration(rand.Int64N(int64(p.SplayMinutes) * int64(time.Minute))))
+		r.splayed[p.ID] = at
+	}
+	if now.Before(at) {
+		return false
+	}
+	delete(r.splayed, p.ID)
+	return true
 }
 
 // ValidateWebhookURL accepts an http or https URL with a host.
@@ -190,6 +213,8 @@ type Notification struct {
 	Hosts   []string  `json:"hosts"`
 	Time    time.Time `json:"time"`
 	Text    string    `json:"text"`
+	// URL is Link in full, when the UI was started with -public-url.
+	URL string `json:"url,omitempty"`
 }
 
 var webhookClient = &http.Client{Timeout: 10 * time.Second}
@@ -221,9 +246,20 @@ func (r *Runner) notify(id int64, p store.Project) {
 	} else {
 		n.Text = fmt.Sprintf("Conn3x: %s drifted on %s (run %d)", p.Name, strings.Join(n.Hosts, ", "), id)
 	}
+	r.withURL(&n)
 	if err := postWebhook(p.WebhookURL, n); err != nil {
 		r.Log.Printf("run %d: webhook: %v", id, err)
 	}
+}
+
+// withURL fills in n's full link, and ends its text with it, when the UI
+// knows its own address.
+func (r *Runner) withURL(n *Notification) {
+	if r.PublicURL == "" {
+		return
+	}
+	n.URL = strings.TrimRight(r.PublicURL, "/") + n.Link
+	n.Text += ": " + n.URL
 }
 
 // postWebhook posts n as JSON to u. Its error never holds u, which may

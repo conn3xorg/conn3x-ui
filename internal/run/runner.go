@@ -44,6 +44,9 @@ type Runner struct {
 	// Git is the git binary. Empty means "git" on PATH.
 	Git string
 	Log *log.Logger
+	// PublicURL is the UI's address, such as https://conn3x.example.com,
+	// for full links in webhooks. Empty leaves them as paths.
+	PublicURL string
 
 	ctx     context.Context
 	wg      sync.WaitGroup
@@ -53,12 +56,15 @@ type Runner struct {
 	cancels map[int64]context.CancelCauseFunc
 	// hide replaces each running run's credential values in its log.
 	hide map[int64]*strings.Replacer
+	// splayed is when each project's due drift check starts, once its
+	// splay has picked a delay.
+	splayed map[int64]time.Time
 }
 
 // New makes a Runner. Cancelling ctx interrupts every running conn3x.
 func New(ctx context.Context, st *store.Store, dataDir string) *Runner {
 	return &Runner{Store: st, DataDir: dataDir, Log: log.Default(), ctx: ctx,
-		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}, hide: map[int64]*strings.Replacer{}}
+		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}, hide: map[int64]*strings.Replacer{}, splayed: map[int64]time.Time{}}
 }
 
 // Wait blocks until every run has finished.
@@ -100,18 +106,20 @@ func (r *Runner) StartApply(ctx context.Context, plan store.Run, p store.Project
 	return id, nil
 }
 
-// StartDrift queues a drift check of p, started by its schedule, and
-// returns the run's ID at once. When the check finds drift or fails, p's
-// webhook hears about it.
-func (r *Runner) StartDrift(ctx context.Context, p store.Project) (int64, error) {
-	id, err := r.Store.CreateRun(ctx, p.ID, store.KindDrift, 0)
+// StartDrift queues a drift check of p, started by userID, or by its
+// schedule when userID is 0, and returns the run's ID at once. When the
+// check finds drift or fails, p's webhook hears about it. Only a check the
+// schedule started goes on to correct or converge: one somebody started
+// is for looking.
+func (r *Runner) StartDrift(ctx context.Context, p store.Project, userID int64) (int64, error) {
+	id, err := r.Store.CreateRun(ctx, p.ID, store.KindDrift, userID)
 	if err != nil {
 		return 0, err
 	}
 	r.wg.Go(func() {
 		r.run(id, p, func(ctx context.Context, env []string) error { return r.doDrift(ctx, id, p, env) })
 		r.notify(id, p)
-		if p.ScheduleMode == store.ModeCorrect || p.ScheduleMode == store.ModeConverge {
+		if userID == 0 && (p.ScheduleMode == store.ModeCorrect || p.ScheduleMode == store.ModeConverge) {
 			r.correct(id, p)
 		}
 	})

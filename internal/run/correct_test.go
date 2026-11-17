@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
@@ -42,5 +43,36 @@ func TestUnattended(t *testing.T) {
 		if n != c.n || (c.why == "") != (why == "") || !strings.Contains(why, c.why) {
 			t.Errorf("%s: %d changes, %q", c.name, n, why)
 		}
+	}
+}
+
+// A splay holds a due check back by a delay it picks once, then lets it
+// start; a fresh delay is picked the next time.
+func TestSplay(t *testing.T) {
+	r := &Runner{splayed: map[int64]time.Time{}}
+	now := time.Date(2026, 11, 17, 3, 0, 0, 0, time.UTC)
+	if !r.splay(store.Project{ID: 1}, now) {
+		t.Error("no splay held a check back")
+	}
+	p := store.Project{ID: 2, SplayMinutes: 30}
+	if r.splay(p, now) && r.splayed[2].IsZero() {
+		// rand picked 0: allowed, and nothing is left pending.
+		return
+	}
+	at := r.splayed[2]
+	if at.Before(now) || !at.Before(now.Add(30*time.Minute)) {
+		t.Fatalf("delay to %v", at)
+	}
+	if r.splay(p, at.Add(-time.Second)) {
+		t.Error("started before its delay")
+	}
+	if r.splayed[2] != at {
+		t.Error("the delay was picked again while waiting")
+	}
+	if !r.splay(p, at) {
+		t.Error("didn't start once its delay passed")
+	}
+	if _, ok := r.splayed[2]; ok {
+		t.Error("the delay stayed for next time")
 	}
 }

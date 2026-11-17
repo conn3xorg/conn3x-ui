@@ -167,6 +167,7 @@ func (r *Runner) notifyScheduled(p store.Project, id int64, status, outcome, tex
 		hosts = []string{}
 	}
 	n := Notification{Project: p.Name, RunID: id, Status: status, Outcome: outcome, Link: fmt.Sprintf("/runs/%d", id), Hosts: hosts, Time: time.Now().UTC(), Text: text}
+	r.withURL(&n)
 	if err := postWebhook(p.WebhookURL, n); err != nil {
 		r.Log.Printf("run %d: webhook: %v", id, err)
 	}

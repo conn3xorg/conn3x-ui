@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -44,7 +45,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
+		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-public-url URL] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -58,8 +59,9 @@ func main() {
 	fs.StringVar(&oc.redirectURL, "oidc-redirect-url", "", "this UI's callback, https://HOST/login/oidc/callback, as registered with the provider")
 	fs.StringVar(&oc.emailDomain, "oidc-email-domain", "", "only let in OIDC users with a verified email in this domain")
 	fs.BoolVar(&oc.noPassword, "no-password-sign-in", false, "turn off sign-in with a password, once a site admin signs in with OIDC")
+	publicURL := fs.String("public-url", "", "this UI's address, such as https://conn3x.example.com, for full links in webhooks")
 	fs.Parse(os.Args[2:])
-	if err := serve(*listen, *data, *keyFile, oc); err != nil {
+	if err := serve(*listen, *data, *keyFile, *publicURL, oc); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -162,7 +164,12 @@ func rotateKey(data, oldFile, newFile string) error {
 	return nil
 }
 
-func serve(listen, data, keyFile string, oc oidcConfig) error {
+func serve(listen, data, keyFile, publicURL string, oc oidcConfig) error {
+	if publicURL != "" {
+		if u, err := url.Parse(publicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("-public-url must be an http or https URL, such as https://conn3x.example.com")
+		}
+	}
 	key, err := loadKey(keyFile, keyEnv)
 	if err != nil {
 		return err
@@ -216,6 +223,7 @@ func serve(listen, data, keyFile string, oc oidcConfig) error {
 		}
 	}
 	runner := run.New(ctx, st, data)
+	runner.PublicURL = publicURL
 	if n, err := runner.RemoveLeftovers(); err != nil {
 		return err
 	} else if n > 0 {

@@ -143,6 +143,10 @@ Somebody fixed a host by hand at 2am, and the state doesn't know. A drift check 
 
 When a check is due, the UI queues it like any other run, so one run at a time per project still holds. A check clones the ref, runs `conn3x init -input=false`, then `conn3x plan -refresh-only -detailed-exitcode -input=false` with `-json`. Nothing is planned or applied. Exit 2 means a host no longer matches the state, and the run ends `drift`; exit 0 ends it `clean`. Both show in **Runs**, where the outcome filter takes `drift` and `clean`, and the host filter finds the hosts that drifted.
 
+Set a **splay** to start each check up to that many minutes after it's due, a different delay each time, so fifty projects on `0 * * * *` don't all clone and plan at once.
+
+Want to know now? **Check drift now** on the project page runs a check straight away, for anyone who can plan. It only looks: even in a project set to correct or converge, a check you start yourself never plans or applies.
+
 When is a check due? One interval, or the next cron slot, after the last check started. That survives a restart: a UI that was down past a slot runs the check once when it starts, not once for every slot it missed. A project's first check comes one slot after the schedule was saved.
 
 ### Putting drift back
@@ -180,7 +184,7 @@ Add a **drift webhook** to hear about it. When a check finds drift, or fails, th
 }
 ```
 
-`link` is the run's path on the UI; put your UI's address in front. `text` is a one-line summary, for chat webhooks that read a `text` field. A failed check has `"status": "failed"` and an empty `outcome`. If the webhook fails, the log says so and the run stands as it ended.
+`link` is the run's path on the UI. Start the UI with `-public-url https://conn3x.example.com` and the payload also has `url`, the full address, and `text` ends with it. `text` is a one-line summary, for chat webhooks that read a `text` field. A failed check has `"status": "failed"` and an empty `outcome`. If the webhook fails, the log says so and the run stands as it ended.
 
 When a check corrects or converges, the webhook hears twice: once for the drift, and once for what came of it. A plan that waits has `"outcome": "waiting"`, its `run_id` is the plan's, and `text` says why it waits. An apply the schedule made has `"outcome": "corrected"` when it succeeds, or its `status` when it doesn't. A plan that found nothing to change sends nothing more.
 
@@ -281,7 +285,7 @@ No password or credential value is ever in it. An entry keeps the user's and pro
 The rest of the design, in the order it's planned:
 
 - Roles for OIDC groups, more than one provider (GitHub, which isn't OIDC, among them), and exporting the audit log: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and the audit log are in.
-- Drift notifications by email, and a Check drift button: [#893](https://github.com/conn3xorg/conn3x/issues/893)
+- Drift notifications by email: [#893](https://github.com/conn3xorg/conn3x/issues/893)
 - apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).
