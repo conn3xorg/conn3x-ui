@@ -91,6 +91,7 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /projects/{id}", s.updateProject)
 	s.mux.HandleFunc("POST /projects/{id}/delete", s.deleteProject)
 	s.mux.HandleFunc("POST /projects/{id}/plan", s.startPlan)
+	s.mux.HandleFunc("POST /projects/{id}/drift", s.startDrift)
 	s.mux.HandleFunc("POST /projects/{id}/credentials", s.setCredential)
 	s.mux.HandleFunc("POST /projects/{id}/credentials/{name}/delete", s.deleteCredential)
 	s.mux.HandleFunc("POST /projects/{id}/roles", s.setRole)
@@ -382,6 +383,9 @@ func projectForm(r *http.Request) (store.Project, error) {
 		return p, errors.New("the most changes a schedule may apply is a whole number, 0 for no limit")
 	}
 	p.MaxChanges = n
+	if p.SplayMinutes, err = strconv.Atoi(f("splay_minutes", "0")); err != nil || p.SplayMinutes < 0 || p.SplayMinutes > 1440 {
+		return p, errors.New("the splay is a whole number of minutes, from 0 to 1440")
+	}
 	return p, nil
 }
 
@@ -607,6 +611,22 @@ func (s *Server) startPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), sess(r).user, p, "plan", fmt.Sprintf("run %d", runID))
+	http.Redirect(w, r, fmt.Sprintf("/runs/%d", runID), http.StatusSeeOther)
+}
+
+// startDrift runs a drift check now. It only looks: whatever the project's
+// schedule mode, a check somebody starts never corrects or converges.
+func (s *Server) startDrift(w http.ResponseWriter, r *http.Request) {
+	p, _, ok := s.allowed(w, r, id(r), store.RolePlanner)
+	if !ok {
+		return
+	}
+	runID, err := s.Runner.StartDrift(r.Context(), p, sess(r).user.ID)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r.Context(), sess(r).user, p, "drift check", fmt.Sprintf("run %d", runID))
 	http.Redirect(w, r, fmt.Sprintf("/runs/%d", runID), http.StatusSeeOther)
 }
 

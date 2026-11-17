@@ -8,6 +8,11 @@
   <button class="primary">Plan</button>
   <small>Fetches {{.Data.Project.GitRef}} and shows what would change. Nothing is applied.</small>
 </form>
+<form method="post" action="/projects/{{.Data.Project.ID}}/drift" style="display:inline">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button>Check drift now</button>
+  <small>Reads each host and says what no longer matches the state. Changes nothing, whatever the schedule does.</small>
+</form>
 {{end}}
 <div class="cols">
 <section>

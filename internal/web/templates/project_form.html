@@ -18,6 +18,9 @@
 <label for="schedule">Drift check schedule</label>
 <input id="schedule" name="schedule" value="{{.Data.Form.Schedule}}" placeholder="6h, or 0 3 * * *">
 <small>An interval such as <code>1h</code> or <code>24h</code>, or five cron fields in UTC. Each check runs <code>conn3x plan -refresh-only</code>. Blank for none.</small>
+<label for="splay_minutes">Splay, in minutes</label>
+<input id="splay_minutes" name="splay_minutes" type="number" min="0" max="1440" value="{{.Data.Form.SplayMinutes}}">
+<small>Starts each check up to this many minutes after it's due, a different delay each time, so projects on the same schedule don't all start together. 0 starts it on time.</small>
 <label for="schedule_mode">When a check finds drift</label>
 {{if .User.Admin}}<select id="schedule_mode" name="schedule_mode">
   <option value="report"{{if eq .Data.Form.ScheduleMode "report" ""}} selected{{end}}>Report it, and change nothing</option>

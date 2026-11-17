@@ -1053,3 +1053,53 @@ func TestScheduledApply(t *testing.T) {
 		t.Errorf("waiting plan page:\n%s", body)
 	}
 }
+
+// Check drift now runs a check as the person who pressed it, and only
+// looks: in a project that corrects drift, nothing is planned or applied.
+// With -public-url, the webhook carries the run's full address.
+func TestCheckDriftNow(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	var mu sync.Mutex
+	var got []run.Notification
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n run.Notification
+		json.NewDecoder(r.Body).Decode(&n)
+		mu.Lock()
+		got = append(got, n)
+		mu.Unlock()
+	}))
+	defer hook.Close()
+	e.runner.PublicURL = "https://conn3x.example.com/"
+	ctx := context.Background()
+	pid, err := e.st.CreateProject(ctx, store.Project{Name: "web", GitURL: repo, GitRef: "main", Path: ".", Conn3xPath: exe, Env: "CONN3X_FAKE=driftfix",
+		WebhookURL: hook.URL, ScheduleMode: store.ModeCorrect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.login(t)
+	project := fmt.Sprintf("/projects/%d", pid)
+	if _, page := e.get(project); !strings.Contains(page, "Check drift now") {
+		t.Fatalf("no button:\n%s", page)
+	}
+	resp := e.post(project+"/drift", url.Values{"csrf": {e.csrf(project)}})
+	if resp.StatusCode != 303 {
+		t.Fatalf("check now: %d", resp.StatusCode)
+	}
+	e.runner.Wait()
+	rn, err := e.st.LastRun(ctx, pid, store.KindDrift)
+	if err != nil || rn.Outcome != store.OutcomeDrift || !rn.CreatedBy.Valid || rn.BySchedule || resp.Header.Get("Location") != fmt.Sprintf("/runs/%d", rn.ID) {
+		t.Fatalf("drift run %+v, %v", rn, err)
+	}
+	if _, err := e.st.LastRun(ctx, pid, store.KindPlan); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a check somebody started planned: %v", err)
+	}
+	want := fmt.Sprintf("https://conn3x.example.com/runs/%d", rn.ID)
+	if len(got) != 1 || got[0].URL != want || !strings.HasSuffix(got[0].Text, ": "+want) || got[0].Link != fmt.Sprintf("/runs/%d", rn.ID) {
+		t.Errorf("notifications %+v", got)
+	}
+	if _, page := e.get(fmt.Sprintf("/runs/%d", rn.ID)); !strings.Contains(page, "started by admin") {
+		t.Errorf("run page doesn't name who started it:\n%s", page)
+	}
+}
