@@ -136,7 +136,14 @@ func TestMain(m *testing.M) {
 		if mode != "driftfix" {
 			changes += `,{"address":"conn3x_command.web__build[\"web2\"]","change":{"actions":["create"]}},{"address":"conn3x_command.web__deploy[\"web1\"]","change":{"actions":["create"]}}`
 		}
-		fmt.Printf(`{"format_version":"1.2","resource_changes":[%s],"resource_drift":[{"address":"conn3x_command.web__build[\"web1\"]"}]}`+"\n", changes)
+		// What the plan's data sources read: web1 and web2's facts, and
+		// web1's packages, one of them marked sensitive.
+		prior := `{"values":{"root_module":{"resources":[` +
+			`{"mode":"data","type":"conn3x_host","index":"web1","values":{"os_id":"rocky","os_version":"10.2","cpus":4,"ssh":[{"host":"10.0.0.1"}],"id":"x"},"sensitive_values":{"ssh":[{}]}},` +
+			`{"mode":"data","type":"conn3x_host","index":"web2","values":{"os_id":"ubuntu","os_version":"24.04"},"sensitive_values":{}},` +
+			`{"mode":"data","type":"conn3x_command","index":"web1","values":{"stdout":"secret"},"sensitive_values":{}}],` +
+			`"child_modules":[{"resources":[{"mode":"data","type":"conn3x_packages","index":"web1","values":{"packages":{"openssl":"3.2.2","hidden":"1"}},"sensitive_values":{"packages":{"hidden":true}}}]}]}}}`
+		fmt.Printf(`{"format_version":"1.2","prior_state":%s,"resource_changes":[%s],"resource_drift":[{"address":"conn3x_command.web__build[\"web1\"]"}]}`+"\n", prior, changes)
 	case "apply":
 		if b, err := os.ReadFile(os.Args[len(os.Args)-1]); err != nil || string(b) != "plan" {
 			fmt.Fprintf(out, `{"@level":"error","@message":"Error: no plan file","type":"diagnostic","diagnostic":{"severity":"error","summary":"no plan file","detail":%q}}`+"\n", fmt.Sprint(os.Args, err))
@@ -1151,5 +1158,82 @@ func TestDriftEmail(t *testing.T) {
 	form := url.Values{"csrf": {e.csrf(project)}, "name": {"web"}, "git_url": {repo}, "conn3x_path": {exe}, "env": {"CONN3X_FAKE=drift"}, "notify_email": {"ops@example.com, nope"}}
 	if resp, body := e.postBody(project, form); resp.StatusCode != 400 || !strings.Contains(body, "isn&#39;t an email address") {
 		t.Errorf("bad address: %d\n%s", resp.StatusCode, body)
+	}
+}
+
+// The fleet store keeps each run's step results and each host's latest
+// facts, and its API answers by fact, host and outcome, only for projects
+// the person can view.
+func TestFleetStore(t *testing.T) {
+	e := setup(t)
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	e.login(t)
+	project := e.createProject(t, "web", repo, ".", exe, "CONN3X_FAKE=plan\n")
+	plan, _ := e.plan(t, project)
+	e.apply(t, plan)
+	e.runner.Wait()
+
+	get := func(c *client, path string, v any) int {
+		t.Helper()
+		resp, body := c.get(path)
+		if resp.StatusCode == 200 {
+			if err := json.Unmarshal([]byte(body), v); err != nil {
+				t.Fatalf("%s: %v\n%s", path, err, body)
+			}
+		}
+		return resp.StatusCode
+	}
+	var hosts struct {
+		Hosts []store.FleetHost `json:"hosts"`
+	}
+	if code := get(e.client, "/api/v1/hosts?fact=os_id:rocky&fact=packages:openssl", &hosts); code != 200 || len(hosts.Hosts) != 1 || hosts.Hosts[0].Host != "web1" || hosts.Hosts[0].Project != "web" {
+		t.Fatalf("rocky with openssl: %d %+v", code, hosts)
+	}
+	f := hosts.Hosts[0].Facts
+	if f["conn3x_host"]["os_version"] != "10.2" || f["conn3x_host"]["ssh"] != nil || f["conn3x_host"]["id"] != nil || f["conn3x_command"] != nil {
+		t.Errorf("web1's facts %v", f)
+	}
+	if pk, _ := f["conn3x_packages"]["packages"].(map[string]any); pk["openssl"] != "3.2.2" || pk["hidden"] != nil {
+		t.Errorf("packages kept %v", pk)
+	}
+	if get(e.client, "/api/v1/hosts?fact=os_id:debian", &hosts); len(hosts.Hosts) != 0 {
+		t.Errorf("debian: %+v", hosts)
+	}
+	var res struct {
+		Results []store.StepResult `json:"results"`
+	}
+	if get(e.client, "/api/v1/steps?outcome=failed", &res); len(res.Results) != 1 || res.Results[0].Host != "web1" || res.Results[0].Step != "box.deploy" || res.Results[0].Kind != store.ResultApplied {
+		t.Errorf("failed steps %+v", res)
+	}
+	if get(e.client, "/api/v1/hosts/web2/changes?since=2000-01-01", &res); len(res.Results) != 1 || res.Results[0].Step != "box.build" || res.Results[0].Outcome != "ok" {
+		t.Errorf("web2's changes %+v", res)
+	}
+	if get(e.client, "/api/v1/steps?circuit=other", &res); len(res.Results) != 0 {
+		t.Errorf("another circuit %+v", res)
+	}
+
+	// Someone with no role on the project sees none of it; nobody signed in
+	// gets a 401, not the sign-in page.
+	bob := e.user(t, "bob", "", "")
+	if get(bob, "/api/v1/hosts", &hosts); len(hosts.Hosts) != 0 {
+		t.Errorf("bob sees %+v", hosts)
+	}
+	if get(bob, "/api/v1/steps", &res); len(res.Results) != 0 {
+		t.Errorf("bob sees %+v", res)
+	}
+	if resp, body := newClient(t, e.base).get("/api/v1/hosts"); resp.StatusCode != 401 || !strings.Contains(body, "sign in") {
+		t.Errorf("signed out: %d %s", resp.StatusCode, body)
+	}
+
+	// Results past the retention go; facts stay.
+	if n, err := e.st.PruneStepResults(context.Background(), time.Now().Add(time.Hour).UTC().Format(time.RFC3339)); err != nil || n == 0 {
+		t.Errorf("pruned %d, %v", n, err)
+	}
+	if get(e.client, "/api/v1/steps", &res); len(res.Results) != 0 {
+		t.Errorf("after pruning %+v", res)
+	}
+	if get(e.client, "/api/v1/hosts", &hosts); len(hosts.Hosts) != 2 {
+		t.Errorf("facts went with the results: %+v", hosts)
 	}
 }

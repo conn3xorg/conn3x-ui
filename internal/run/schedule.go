@@ -133,8 +133,17 @@ func (r *Runner) Schedule(ctx context.Context) {
 }
 
 // Tick queues a drift check of each project whose schedule is due at now
-// and whose last check has finished.
+// and whose last check has finished. Once an hour it also removes step
+// results older than Retention from the fleet store.
 func (r *Runner) Tick(ctx context.Context, now time.Time) {
+	if r.Retention > 0 && now.Sub(r.pruned) >= time.Hour {
+		r.pruned = now
+		if n, err := r.Store.PruneStepResults(ctx, now.Add(-r.Retention).UTC().Format(time.RFC3339)); err != nil {
+			r.Log.Printf("fleet store: %v", err)
+		} else if n > 0 {
+			r.Log.Printf("fleet store: removed %d step results older than %s", n, r.Retention)
+		}
+	}
 	ps, err := r.Store.Projects(ctx)
 	if err != nil {
 		r.Log.Printf("schedule: %v", err)

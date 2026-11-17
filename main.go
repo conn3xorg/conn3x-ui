@@ -65,6 +65,7 @@ func main() {
 	fs.StringVar(&oc.adminGroup, "oidc-admin-group", "", "OIDC group whose members are site admins, checked at each sign-in")
 	fs.Var(&oc.roles, "oidc-role", "GROUP=PROJECT:ROLE gives the group's members that role on the project, checked at each sign-in; repeat it for more")
 	publicURL := fs.String("public-url", "", "this UI's address, such as https://conn3x.example.com, for full links in webhooks")
+	retention := fs.Duration("fleet-retention", 90*24*time.Hour, "how long the fleet store keeps step results; the latest facts per host are kept for good")
 	var mc mailConfig
 	fs.StringVar(&mc.addr, "smtp-addr", "", "SMTP server, host:port, for drift emails; STARTTLS is required except on loopback")
 	fs.StringVar(&mc.from, "smtp-from", "", "address drift emails come from")
@@ -75,7 +76,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := serve(*listen, *data, *keyFile, *publicURL, oc, mailer); err != nil {
+	if err := serve(*listen, *data, *keyFile, *publicURL, oc, mailer, *retention); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -231,7 +232,7 @@ func (mc mailConfig) mailer() (*mail.Mailer, error) {
 	return &mail.Mailer{Addr: mc.addr, From: from[0], User: mc.user, Password: pw}, nil
 }
 
-func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.Mailer) error {
+func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.Mailer, retention time.Duration) error {
 	if publicURL != "" {
 		if u, err := url.Parse(publicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("-public-url must be an http or https URL, such as https://conn3x.example.com")
@@ -291,6 +292,7 @@ func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.
 	}
 	runner := run.New(ctx, st, data)
 	runner.PublicURL = publicURL
+	runner.Retention = retention
 	if mailer != nil { // a nil *Mailer in the interface would look set
 		runner.Mailer = mailer
 	}

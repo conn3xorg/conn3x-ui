@@ -4,11 +4,9 @@
 package run
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"slices"
 	"strings"
 	"time"
@@ -77,15 +75,11 @@ func unattended(pl planJSON, mode string, max int) (changes int, why string) {
 // showPlan reads the saved plan in work with conn3x show -json.
 func showPlan(ctx context.Context, conn3x, work string, env []string) (planJSON, error) {
 	var pl planJSON
-	cmd := exec.CommandContext(ctx, conn3x, "show", "-json", "plan.bin")
-	cmd.Dir, cmd.Env = work, append(cmd.Environ(), env...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	b, err := showJSON(ctx, conn3x, work, env)
 	if err != nil {
-		return pl, fmt.Errorf("show: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return pl, err
 	}
-	return pl, json.Unmarshal(out, &pl)
+	return pl, json.Unmarshal(b, &pl)
 }
 
 // correct follows a drift check, run driftID, that found drift: it plans,

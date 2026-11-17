@@ -64,12 +64,17 @@ type Runner struct {
 	// splayed is when each project's due drift check starts, once its
 	// splay has picked a delay.
 	splayed map[int64]time.Time
+	// pruned is when step results past Retention were last removed.
+	pruned time.Time
+	// Retention is how long the fleet store keeps step results. The latest
+	// facts per host are kept for good.
+	Retention time.Duration
 }
 
 // New makes a Runner. Cancelling ctx interrupts every running conn3x.
 func New(ctx context.Context, st *store.Store, dataDir string) *Runner {
 	return &Runner{Store: st, DataDir: dataDir, Log: log.Default(), ctx: ctx,
-		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}, hide: map[int64]*strings.Replacer{}, splayed: map[int64]time.Time{}}
+		locks: map[int64]*sync.Mutex{}, subs: map[int64]map[chan Line]struct{}{}, cancels: map[int64]context.CancelCauseFunc{}, hide: map[int64]*strings.Replacer{}, splayed: map[int64]time.Time{}, Retention: 90 * 24 * time.Hour}
 }
 
 // Wait blocks until every run has finished.
@@ -195,7 +200,10 @@ func (r *Runner) run(id int64, p store.Project, do func(ctx context.Context, env
 	}
 	lines, _, err := r.Store.Events(bg, id)
 	if err == nil {
-		err = r.Store.SetRunHosts(bg, id, Group(lines).HostOutcomes())
+		res := Group(lines)
+		if err = r.Store.SetRunHosts(bg, id, res.HostOutcomes()); err == nil {
+			err = r.Store.SaveStepResults(bg, id, p.ID, res.StepResults())
+		}
 	}
 	if err != nil {
 		r.Log.Printf("run %d: %v", id, err)
@@ -468,6 +476,7 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	if err := copyFile(filepath.Join(work, "plan.bin"), r.PlanFile(id)); err != nil {
 		return err
 	}
+	r.saveFacts(ctx, id, p, work, env)
 	if after != nil {
 		return after(work)
 	}
@@ -492,9 +501,9 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	} else if t == "local" {
 		return ErrLocalState
 	}
-	r.note(id, "conn3x plan -refresh-only -detailed-exitcode -input=false")
+	r.note(id, "conn3x plan -refresh-only -detailed-exitcode -input=false -out=plan.bin")
 	outcome := store.OutcomeClean
-	err = c.Run(ctx, r.record(id), "plan", "-refresh-only", "-detailed-exitcode", "-input=false")
+	err = c.Run(ctx, r.record(id), "plan", "-refresh-only", "-detailed-exitcode", "-input=false", "-out=plan.bin")
 	var exit *conn3xexec.ExitError
 	if errors.As(err, &exit) && exit.Code == 2 {
 		outcome, err = store.OutcomeDrift, nil
@@ -502,6 +511,7 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	if err != nil {
 		return fmt.Errorf("plan: %w", err)
 	}
+	r.saveFacts(ctx, id, p, work, env)
 	return r.Store.SetRunOutcome(context.Background(), id, outcome)
 }
 
