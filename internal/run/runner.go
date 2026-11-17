@@ -81,7 +81,7 @@ func (r *Runner) StartPlan(ctx context.Context, p store.Project, userID int64) (
 		return 0, err
 	}
 	r.wg.Go(func() {
-		r.run(id, p, func(ctx context.Context, env []string) error { return r.doPlan(ctx, id, p, env) })
+		r.run(id, p, func(ctx context.Context, env []string) error { return r.doPlan(ctx, id, p, env, nil) })
 	})
 	return id, nil
 }
@@ -111,6 +111,9 @@ func (r *Runner) StartDrift(ctx context.Context, p store.Project) (int64, error)
 	r.wg.Go(func() {
 		r.run(id, p, func(ctx context.Context, env []string) error { return r.doDrift(ctx, id, p, env) })
 		r.notify(id, p)
+		if p.ScheduleMode == store.ModeCorrect || p.ScheduleMode == store.ModeConverge {
+			r.correct(id, p)
+		}
 	})
 	return id, nil
 }
@@ -418,7 +421,9 @@ func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha st
 	return work, commit, func() { os.RemoveAll(tmp) }, nil
 }
 
-func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []string) error {
+// doPlan plans and saves the plan file. after, when set, reads the plan in
+// the checkout before it's removed.
+func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []string, after func(work string) error) error {
 	work, _, cleanup, err := r.checkout(ctx, id, p, "", env)
 	if err != nil {
 		return err
@@ -447,7 +452,13 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return copyFile(filepath.Join(work, "plan.bin"), r.PlanFile(id))
+	if err := copyFile(filepath.Join(work, "plan.bin"), r.PlanFile(id)); err != nil {
+		return err
+	}
+	if after != nil {
+		return after(work)
+	}
+	return nil
 }
 
 // doDrift refreshes the state against the hosts without planning any

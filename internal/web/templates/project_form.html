@@ -18,7 +18,19 @@
 <label for="schedule">Drift check schedule</label>
 <input id="schedule" name="schedule" value="{{.Data.Form.Schedule}}" placeholder="6h, or 0 3 * * *">
 <small>An interval such as <code>1h</code> or <code>24h</code>, or five cron fields in UTC. Each check runs <code>conn3x plan -refresh-only</code>. Blank for none.</small>
-<label for="webhook_url">Drift webhook</label>
+<label for="schedule_mode">When a check finds drift</label>
+{{if .User.Admin}}<select id="schedule_mode" name="schedule_mode">
+  <option value="report"{{if eq .Data.Form.ScheduleMode "report" ""}} selected{{end}}>Report it, and change nothing</option>
+  <option value="correct"{{if eq .Data.Form.ScheduleMode "correct"}} selected{{end}}>Correct it: apply a plan that only puts back what drifted</option>
+  <option value="converge"{{if eq .Data.Form.ScheduleMode "converge"}} selected{{end}}>Converge: apply any plan with no delete or replace</option>
+</select>
+<label for="max_changes">Most changes a schedule may apply</label>
+<input id="max_changes" name="max_changes" type="number" min="0" value="{{.Data.Form.MaxChanges}}">
+<small>A plan the schedule makes is applied with nobody approving it only if it deletes and replaces nothing, stays under this many changes (0 for no limit) and, when correcting, only updates what drifted. Otherwise it waits for an approver, and the webhook says so.</small>
+{{else}}<input type="hidden" name="schedule_mode" value="{{.Data.Form.ScheduleMode}}"><input type="hidden" name="max_changes" value="{{.Data.Form.MaxChanges}}">
+<p>{{if eq .Data.Form.ScheduleMode "correct"}}Correct it: apply a plan that only puts back what drifted{{else if eq .Data.Form.ScheduleMode "converge"}}Converge: apply any plan with no delete or replace{{else}}Report it, and change nothing{{end}}{{if .Data.Form.MaxChanges}}, at most {{.Data.Form.MaxChanges}} changes{{end}}.</p>
+<small>Only a site admin can change this, since it lets the schedule change hosts with nobody approving.</small>
+{{end}}<label for="webhook_url">Drift webhook</label>
 <input id="webhook_url" name="webhook_url" autocomplete="off" spellcheck="false" placeholder="https://hooks.slack.com/services/...">
 <small>Gets a JSON POST when a check finds drift or fails.{{with .Data.Form.WebhookHost}} One is set, to {{.}}; leave this blank to keep it.{{end}}</small>
 <label><input type="checkbox" name="self_apply" value="1" style="width:auto"{{if .Data.Form.SelfApply}} checked{{end}}> Planners may apply their own plans</label>

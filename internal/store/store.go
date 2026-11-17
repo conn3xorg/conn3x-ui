@@ -140,6 +140,13 @@ var migrations = []string{
 	`ALTER TABLE users ADD COLUMN oidc_issuer TEXT;
 	ALTER TABLE users ADD COLUMN oidc_subject TEXT;
 	CREATE UNIQUE INDEX users_oidc ON users(oidc_issuer, oidc_subject);`,
+	// 8: what a drift check may do about the drift it finds, the most
+	// changes it may make unattended, and which runs the schedule started.
+	// Every drift check so far was the schedule's.
+	`ALTER TABLE projects ADD COLUMN schedule_mode TEXT NOT NULL DEFAULT 'report';
+	ALTER TABLE projects ADD COLUMN max_changes INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN by_schedule INTEGER NOT NULL DEFAULT 0;
+	UPDATE runs SET by_schedule = 1 WHERE kind = 'drift';`,
 }
 
 // Store is the database.
@@ -216,8 +223,14 @@ type Project struct {
 	WebhookURL string
 	// SelfApply lets a planner apply a plan they made themselves.
 	SelfApply bool
-	CreatedAt string
-	UpdatedAt string
+	// ScheduleMode is what a drift check does when it finds drift: one of
+	// ModeReport, ModeCorrect and ModeConverge.
+	ScheduleMode string
+	// MaxChanges is the most changes a scheduled apply may make, 0 for no
+	// cap. A plan with more waits for a person.
+	MaxChanges int
+	CreatedAt  string
+	UpdatedAt  string
 }
 
 // WebhookHost is the webhook URL's host, all a page shows of it.
@@ -239,11 +252,11 @@ func (p Project) EnvList() []string {
 	return out
 }
 
-const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, self_apply, created_at, updated_at"
+const projectCols = "id, name, git_url, git_ref, path, conn3x_path, env, schedule, webhook_url, self_apply, schedule_mode, max_changes, created_at, updated_at"
 
 func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 	var p Project
-	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.SelfApply, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.GitURL, &p.GitRef, &p.Path, &p.Conn3xPath, &p.Env, &p.Schedule, &p.WebhookURL, &p.SelfApply, &p.ScheduleMode, &p.MaxChanges, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -253,8 +266,11 @@ func scanProject(row interface{ Scan(...any) error }) (Project, error) {
 // CreateProject adds p and returns its ID.
 func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 	t := now()
-	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, t, t)
+	if p.ScheduleMode == "" {
+		p.ScheduleMode = ModeReport
+	}
+	res, err := s.db.ExecContext(ctx, "INSERT INTO projects ("+projectCols+") VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, p.ScheduleMode, p.MaxChanges, t, t)
 	if err != nil {
 		return 0, err
 	}
@@ -263,8 +279,11 @@ func (s *Store) CreateProject(ctx context.Context, p Project) (int64, error) {
 
 // UpdateProject saves p's fields over the project with p.ID.
 func (s *Store) UpdateProject(ctx context.Context, p Project) error {
-	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, self_apply=?, updated_at=? WHERE id=?",
-		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, now(), p.ID)
+	if p.ScheduleMode == "" {
+		p.ScheduleMode = ModeReport
+	}
+	res, err := s.db.ExecContext(ctx, "UPDATE projects SET name=?, git_url=?, git_ref=?, path=?, conn3x_path=?, env=?, schedule=?, webhook_url=?, self_apply=?, schedule_mode=?, max_changes=?, updated_at=? WHERE id=?",
+		p.Name, p.GitURL, p.GitRef, p.Path, p.Conn3xPath, p.Env, p.Schedule, p.WebhookURL, p.SelfApply, p.ScheduleMode, p.MaxChanges, now(), p.ID)
 	if err != nil {
 		return err
 	}
@@ -335,6 +354,16 @@ const (
 	KindDrift = "drift"
 )
 
+// What a drift check does about drift it finds. Report changes nothing.
+// Correct applies a plan only when every change in it puts back something
+// the same plan saw drift. Converge applies any plan. Neither ever deletes
+// or replaces unattended.
+const (
+	ModeReport   = "report"
+	ModeCorrect  = "correct"
+	ModeConverge = "converge"
+)
+
 // Drift check outcomes: drift when a host no longer matches the state.
 const (
 	OutcomeDrift = "drift"
@@ -367,6 +396,8 @@ type Run struct {
 	// HostOutcome is how the run came out on the host History was asked
 	// about, and "" from anything else.
 	HostOutcome string
+	// BySchedule is a run the schedule started, or an apply it approved.
+	BySchedule bool
 }
 
 // Finished is true once the run has a final status.
@@ -376,13 +407,13 @@ func (r Run) Finished() bool {
 
 const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, " +
 	"(SELECT name FROM users WHERE users.id = runs.created_by), (SELECT name FROM projects WHERE projects.id = runs.project_id), created_at, started_at, finished_at, " +
-	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at, outcome"
+	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at, outcome, by_schedule"
 
 // scanRun reads runCols, then any extra columns into extra.
 func scanRun(row interface{ Scan(...any) error }, extra ...any) (Run, error) {
 	var r Run
 	err := row.Scan(append([]any{&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedByName, &r.ProjectName, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
-		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt, &r.Outcome}, extra...)...)
+		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt, &r.Outcome, &r.BySchedule}, extra...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -392,8 +423,8 @@ func scanRun(row interface{ Scan(...any) error }, extra ...any) (Run, error) {
 // CreateRun adds a queued run and returns its ID. userID 0 is the
 // schedule, not a person.
 func (s *Store) CreateRun(ctx context.Context, projectID int64, kind string, userID int64) (int64, error) {
-	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-		projectID, kind, StatusQueued, sql.NullInt64{Int64: userID, Valid: userID != 0}, now())
+	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at, by_schedule) VALUES (?, ?, ?, ?, ?, ?)",
+		projectID, kind, StatusQueued, sql.NullInt64{Int64: userID, Valid: userID != 0}, now(), userID == 0)
 	if err != nil {
 		return 0, err
 	}
@@ -417,12 +448,13 @@ func (s *Store) Applicable(ctx context.Context, planID int64) (bool, error) {
 }
 
 // CreateApply adds a queued apply of a plan run, approved by userID now,
-// and returns its ID. One insert checks and claims the plan, so two
+// or by the schedule when userID is 0, and returns its ID. One insert checks and claims the plan, so two
 // approvers can't both apply it.
 func (s *Store) CreateApply(ctx context.Context, planID, userID int64) (int64, error) {
 	t := now()
-	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at, plan_run_id, approved_by, approved_at) "+
-		"SELECT p.project_id, ?, ?, ?, ?, p.id, ?, ? "+applicable, KindApply, StatusQueued, userID, t, userID, t, planID)
+	user := sql.NullInt64{Int64: userID, Valid: userID != 0}
+	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_by, created_at, plan_run_id, approved_by, approved_at, by_schedule) "+
+		"SELECT p.project_id, ?, ?, ?, ?, p.id, ?, ?, ? "+applicable, KindApply, StatusQueued, user, t, user, t, userID == 0, planID)
 	if err != nil {
 		return 0, err
 	}
