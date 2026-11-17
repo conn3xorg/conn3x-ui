@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	conn3xexec "github.com/conn3xorg/conn3x-exec"
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
 
@@ -99,8 +100,8 @@ func (r *Runner) correct(driftID int64, p store.Project) {
 	changes := 0
 	r.run(planID, p, func(ctx context.Context, env []string) error {
 		r.note(planID, fmt.Sprintf("Planned by the schedule after drift check %d", driftID))
-		return r.doPlan(ctx, planID, p, env, func(work string) error {
-			pl, err := showPlan(ctx, p.Conn3xPath, work, env)
+		return r.doPlan(ctx, planID, p, env, func(c *conn3xexec.Conn3x) error {
+			pl, err := showPlan(ctx, c.Path, c.Dir, c.Env)
 			if err != nil {
 				return err
 			}

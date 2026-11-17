@@ -5,6 +5,7 @@ go 1.27.2
 require (
 	github.com/conn3xorg/conn3x-exec v0.0.0-20261116004227-803589c0a88a
 	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/landlock-lsm/go-landlock v0.11.2
 	golang.org/x/oauth2 v0.37.0
 	modernc.org/sqlite v1.62.0
 )
@@ -17,6 +18,7 @@ require (
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/sys v0.49.0 // indirect
+	kernel.org/pub/linux/libs/security/libcap/psx v1.2.78 // indirect
 	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect

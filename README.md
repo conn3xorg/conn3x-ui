@@ -222,13 +222,23 @@ The facts are what the circuits read: for a package list, the project's circuit 
 
 ## Trust model
 
-Every run executes a project's circuit on this server, as the user the UI runs as. A circuit can run commands on the machine that plans it, for example through an `external` data source, and that user can read the UI's database and its credentials key. So:
+Every run executes a project's circuit on this server. A circuit can run commands on the machine that plans it, for example through an `external` data source, so what those commands can reach matters.
+
+**On Linux, each run is sandboxed with [Landlock](https://landlock.io).** conn3x, and everything it starts, can write only in the run's own temporary directory, which holds its checkout, and read only the system's programs and libraries, the parts of `/etc` that name hosts, users, certificates and time zones, that run's credential files, and `~/.ssh` and the Terraform CLI settings in the home directory. The UI's database, its credentials key, saved plans and other runs are out of reach, as is signalling the UI itself. Network access is unchanged, so runs reach hosts and cloud APIs as before. It needs a kernel with Landlock turned on, 5.13 or later. The container image has been tested with it under Podman's default seccomp profile.
+
+`-sandbox` picks the mode. `auto`, the default, sandboxes runs when the kernel can and says at start which it is. `on` refuses to start without it, and `off` turns it off. A project that sets `TF_PLUGIN_CACHE_DIR` gets write access to that directory too.
+
+Without the sandbox (`-sandbox=off`, macOS, or an older kernel), a run executes as the user the UI runs as, can read the UI's database and its credentials key, and so:
 
 - **Anyone who can push to a project's repository can run commands here**, and through them read every project's credentials, not only that project's. It's the same with other tools that plan infrastructure code from Git. Give push access only to people you'd trust with this server.
+
+Either way:
+
 - **Only a site admin can change what a run executes:** a project's Git URL, its Conn3x binary and its environment variables. A project admin can't, and the form shows them read-only.
 - **No credential can be named for a variable that changes how a run's programs start**, such as `PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND` or anything starting `TF_` or `CONN3X_`. They're refused when a credential is saved and again when a run starts.
+- **A run can still read what the system lets anyone read**, such as `/etc`, and use the network as this server can. Keep cloud metadata endpoints and internal services behind their own auth, as for any CI runner.
 
-Roles keep people from seeing or changing projects they have no part in; they don't wall one project's runs off from another's. Teams that must not reach each other's credentials need a UI each. Running each run on its own, away from the others, is [#947](https://github.com/conn3xorg/conn3x/issues/947).
+Roles keep people from seeing or changing projects they have no part in. With the sandbox, one project's run can't read another's credentials either.
 
 ## Users and roles
 
