@@ -88,10 +88,18 @@ func showPlan(ctx context.Context, conn3x, work string, env []string) (planJSON,
 // a person. Either way the webhook hears what happened.
 func (r *Runner) correct(driftID int64, p store.Project) {
 	bg := context.Background()
-	if d, err := r.Store.Run(bg, driftID); err != nil || d.Status != store.StatusSucceeded || d.Outcome != store.OutcomeDrift {
+	d, err := r.Store.Run(bg, driftID)
+	if err != nil || d.Status != store.StatusSucceeded || d.Outcome != store.OutcomeDrift {
 		return
 	}
+	by := "the schedule"
+	if d.EventRule != "" {
+		by = "event rule " + d.EventRule
+	}
 	planID, err := r.Store.CreateRun(bg, p.ID, store.KindPlan, 0)
+	if err == nil {
+		err = r.Store.InheritEvent(bg, planID, driftID)
+	}
 	if err != nil {
 		r.Log.Printf("schedule: project %d: %v", p.ID, err)
 		return
@@ -99,7 +107,7 @@ func (r *Runner) correct(driftID int64, p store.Project) {
 	var why string
 	changes := 0
 	r.run(planID, p, func(ctx context.Context, env []string) error {
-		r.note(planID, fmt.Sprintf("Planned by the schedule after drift check %d", driftID))
+		r.note(planID, fmt.Sprintf("Planned by %s after drift check %d", by, driftID))
 		return r.doPlan(ctx, planID, p, env, func(c *conn3xexec.Conn3x) error {
 			pl, err := showPlan(ctx, c.Path, c.Dir, c.Env)
 			if err != nil {
@@ -111,7 +119,7 @@ func (r *Runner) correct(driftID int64, p store.Project) {
 	})
 	plan, err := r.Store.Run(bg, planID)
 	if err != nil || plan.Status != store.StatusSucceeded {
-		r.notifyScheduled(p, planID, store.StatusFailed, "", fmt.Sprintf("Conn3x: the schedule's plan of %s failed (run %d)", p.Name, planID))
+		r.notifyScheduled(p, planID, store.StatusFailed, "", fmt.Sprintf("Conn3x: %s's plan of %s failed (run %d)", by, p.Name, planID))
 		return
 	}
 	switch {
@@ -123,11 +131,14 @@ func (r *Runner) correct(driftID int64, p store.Project) {
 		r.notifyScheduled(p, planID, store.StatusSucceeded, "waiting", fmt.Sprintf("Conn3x: %s has a plan waiting for approval, since %s (run %d)", p.Name, why, planID))
 		return
 	}
-	r.note(planID, fmt.Sprintf("The schedule applies this plan: %d changes, %s.", changes, map[string]string{
+	r.note(planID, fmt.Sprintf("%s applies this plan: %d changes, %s.", upperFirst(by), changes, map[string]string{
 		store.ModeCorrect:  "each one putting back something that drifted",
 		store.ModeConverge: "with no delete or replace",
 	}[p.ScheduleMode]))
 	applyID, err := r.Store.CreateApply(bg, planID, 0)
+	if err == nil {
+		err = r.Store.InheritEvent(bg, applyID, driftID)
+	}
 	if err != nil {
 		r.Log.Printf("schedule: project %d: %v", p.ID, err)
 		return
@@ -139,9 +150,9 @@ func (r *Runner) correct(driftID int64, p store.Project) {
 		return
 	}
 	if a.Status == store.StatusSucceeded {
-		r.notifyScheduled(p, applyID, a.Status, "corrected", fmt.Sprintf("Conn3x: the schedule applied %d changes to %s (run %d)", changes, p.Name, applyID))
+		r.notifyScheduled(p, applyID, a.Status, "corrected", fmt.Sprintf("Conn3x: %s applied %d changes to %s (run %d)", by, changes, p.Name, applyID))
 	} else {
-		r.notifyScheduled(p, applyID, a.Status, "", fmt.Sprintf("Conn3x: the schedule's apply to %s %s (run %d)", p.Name, a.Status, applyID))
+		r.notifyScheduled(p, applyID, a.Status, "", fmt.Sprintf("Conn3x: %s's apply to %s %s (run %d)", by, p.Name, a.Status, applyID))
 	}
 }
 
@@ -164,4 +175,12 @@ func (r *Runner) notifyScheduled(p store.Project, id int64, status, outcome, tex
 	n := Notification{Project: p.Name, RunID: id, Status: status, Outcome: outcome, Link: fmt.Sprintf("/runs/%d", id), Hosts: hosts, Time: time.Now().UTC(), Text: text}
 	r.withURL(&n)
 	r.deliver(p, n)
+}
+
+// upperFirst is s with its first letter a capital.
+func upperFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }

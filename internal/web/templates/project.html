@@ -60,6 +60,49 @@
   {{else}}
   <p><small>Credentials need a key. Make one with <code>openssl rand -base64 32 &gt; key</code>, then start conn3x-ui with <code>-key-file key</code>, or with the value in <code>CONN3X_UI_KEY</code>.</small></p>
   {{end}}
+  <h2>Event rules</h2>
+  {{with .Data.NewRule}}
+  <div class="notice">
+    <p>Event rule <strong>{{.Rule.Name}}</strong> is saved. Its secret is below, and it won't be shown again.</p>
+    <p>URL: <code class="act">{{.Path}}</code> on this server<br>Secret: <code class="act">{{.Secret}}</code></p>
+    <p><small>Alertmanager: send it as a bearer token (<code>http_config: authorization: credentials: …</code>). Anything else: sign each request with <code>X-Conn3x-Timestamp</code> (Unix seconds), a unique <code>X-Conn3x-Delivery</code>, and <code>X-Conn3x-Signature: sha256=</code> the hex HMAC-SHA256 of the timestamp, a dot and the body, keyed with the secret.</small></p>
+  </div>
+  {{end}}
+  {{if .Data.EventRules}}
+  <table>
+    <tr><th>Name</th><th>Matches</th><th>Does</th><th>Debounce</th><th>Last run</th><th></th></tr>
+    {{range .Data.EventRules}}
+    <tr><td class="act">{{.Name}}</td>
+      <td>{{if or .Alertname .Labels}}{{with .Alertname}}alertname={{.}} {{end}}{{range .LabelPairs}}{{index . 0}}={{index . 1}} {{end}}{{else}}any signed request{{end}}</td>
+      <td>{{.Mode}}</td><td>{{.DebounceMinutes}} min</td><td>{{or .LastStartedAt "never"}}</td>
+      <td>{{if $.Data.SiteAdmin}}<form method="post" action="/projects/{{$.Data.Project.ID}}/events/{{.ID}}/delete" onsubmit="return confirm('Delete the event rule {{.Name}}?')">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="danger">Delete</button></form>{{end}}</td></tr>
+    {{end}}
+  </table>
+  {{else}}<p>No event rules. A rule starts a drift check when a signed webhook or a matching Alertmanager alert arrives.</p>{{end}}
+  {{if and .Data.SiteAdmin .Data.HasKey}}
+  <form method="post" action="/projects/{{.Data.Project.ID}}/events">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="rule_name">Name</label>
+    <input id="rule_name" name="name" placeholder="disk-full" required>
+    <label for="rule_alertname">Alertname</label>
+    <input id="rule_alertname" name="alertname" placeholder="DiskFull">
+    <label for="rule_labels">Labels</label>
+    <textarea id="rule_labels" name="labels" placeholder="severity=critical" spellcheck="false"></textarea>
+    <small>Leave both empty to run for any request signed with the rule's secret. Otherwise an Alertmanager alert has to be firing with that alertname and every LABEL=VALUE.</small>
+    <label for="rule_mode">Does about drift</label>
+    <select id="rule_mode" name="mode"><option value="report">reports it</option><option value="correct">corrects it</option><option value="converge">converges</option></select>
+    <small>Correcting and converging have the schedule's guards: nothing is deleted or replaced unattended, and the project's most changes applies.</small>
+    <label for="rule_debounce">Debounce, in minutes</label>
+    <input id="rule_debounce" name="debounce" type="number" min="1" max="1440" value="10" required>
+    <small>After a run, events for this many minutes are folded into it.</small>
+    <p><button class="primary">Add event rule</button></p>
+  </form>
+  {{else if .Data.SiteAdmin}}
+  <p><small>Event rules keep their secrets with the credentials key, so they need one too.</small></p>
+  {{else}}
+  <p><small>Only a site admin adds or deletes event rules: a rule starts runs with nobody watching.</small></p>
+  {{end}}
   <h2>Roles</h2>
   {{if .Data.Members}}
   <table>

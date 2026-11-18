@@ -182,6 +182,31 @@ var migrations = []string{
 		at TEXT NOT NULL,
 		PRIMARY KEY (project_id, host, source)
 	);`,
+	// 13: rules that start a run when a signed webhook or an Alertmanager
+	// alert arrives, the delivery IDs each has seen, and which rule
+	// started a run, with the event that did.
+	`CREATE TABLE event_rules (
+		id INTEGER PRIMARY KEY,
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		name TEXT NOT NULL,
+		secret BLOB NOT NULL,
+		alertname TEXT NOT NULL DEFAULT '',
+		labels TEXT NOT NULL DEFAULT '',
+		mode TEXT NOT NULL DEFAULT 'report',
+		debounce_minutes INTEGER NOT NULL DEFAULT 10,
+		last_started_at TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		UNIQUE (project_id, name)
+	);
+	CREATE TABLE event_deliveries (
+		rule_id INTEGER NOT NULL REFERENCES event_rules(id) ON DELETE CASCADE,
+		delivery TEXT NOT NULL,
+		received_at TEXT NOT NULL,
+		PRIMARY KEY (rule_id, delivery)
+	);
+	ALTER TABLE runs ADD COLUMN event_rule_id INTEGER REFERENCES event_rules(id) ON DELETE SET NULL;
+	ALTER TABLE runs ADD COLUMN event_rule_name TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN event_body TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is the database.
@@ -440,6 +465,9 @@ type Run struct {
 	HostOutcome string
 	// BySchedule is a run the schedule started, or an apply it approved.
 	BySchedule bool
+	// EventRule is the name of the event rule that started the run, or ""
+	// for one it didn't. It stays when the rule is deleted.
+	EventRule string
 }
 
 // Finished is true once the run has a final status.
@@ -449,13 +477,13 @@ func (r Run) Finished() bool {
 
 const runCols = "id, project_id, kind, status, commit_sha, conn3x_version, error, created_by, " +
 	"(SELECT name FROM users WHERE users.id = runs.created_by), (SELECT name FROM projects WHERE projects.id = runs.project_id), created_at, started_at, finished_at, " +
-	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at, outcome, by_schedule"
+	"plan_run_id, approved_by, (SELECT name FROM users WHERE users.id = runs.approved_by), approved_at, outcome, by_schedule, event_rule_name"
 
 // scanRun reads runCols, then any extra columns into extra.
 func scanRun(row interface{ Scan(...any) error }, extra ...any) (Run, error) {
 	var r Run
 	err := row.Scan(append([]any{&r.ID, &r.ProjectID, &r.Kind, &r.Status, &r.CommitSHA, &r.Conn3xVersion, &r.Error, &r.CreatedBy, &r.CreatedByName, &r.ProjectName, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
-		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt, &r.Outcome, &r.BySchedule}, extra...)...)
+		&r.PlanRunID, &r.ApprovedBy, &r.ApprovedByName, &r.ApprovedAt, &r.Outcome, &r.BySchedule, &r.EventRule}, extra...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -850,7 +878,15 @@ func (s *Store) RotateKey(ctx context.Context, newKey []byte) (int, error) {
 			return 0, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, auditInsert, now(), 0, "", 0, "", "credentials key rotated", fmt.Sprintf("%d credentials", len(all))); err != nil {
+	rules, err := resealRules(ctx, tx, s.aead, next.aead)
+	if err != nil {
+		return 0, err
+	}
+	detail := fmt.Sprintf("%d credentials", len(all))
+	if rules > 0 {
+		detail += fmt.Sprintf(", %d event rules", rules)
+	}
+	if _, err := tx.ExecContext(ctx, auditInsert, now(), 0, "", 0, "", "credentials key rotated", detail); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
