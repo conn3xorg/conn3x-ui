@@ -331,4 +331,20 @@ func TestEventLimitAndVars(t *testing.T) {
 	if err != nil || rn.Status == store.StatusSucceeded || !strings.Contains(rn.Error, "isn't in this project") {
 		t.Errorf("an alert for a host not in the project: %+v, %v", rn, err)
 	}
+
+	// A grouped alert for web1 and a host the project lacks checks web1 but
+	// fails, naming the other, rather than reading as no drift for both.
+	partial, partialSecret, err := e.st.CreateEventRule(ctx, store.EventRule{ProjectID: pid, Name: "partial", Alertname: "DiskFull", LimitLabel: "instance", Vars: "mount=mountpoint", Mode: store.ModeReport, DebounceMinutes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out = hookPost(t, e.base, partial.ID, alerts([2]string{"web1:9100", "/tmp"}, [2]string{"phantom:9100", "/tmp"}), map[string]string{"Authorization": "Bearer " + hex.EncodeToString(partialSecret)})
+	if code != http.StatusAccepted || out["result"] != "started" {
+		t.Fatalf("partial: %d %v", code, out)
+	}
+	e.runner.Wait()
+	rn, err = e.st.Run(ctx, int64(out["run"].(float64)))
+	if err != nil || rn.Status == store.StatusSucceeded || !strings.Contains(rn.Error, "phantom") {
+		t.Errorf("an alert for web1 and a host not in the project: %+v, %v", rn, err)
+	}
 }

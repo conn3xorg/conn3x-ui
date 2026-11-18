@@ -436,15 +436,42 @@ func (r *Runner) scrub(id int64, s string) string {
 // alert named had no drift when it was never checked.
 var ErrNoHost = errors.New("the alert's host isn't in this project: -limit matched no host, so nothing was checked")
 
-// limitMatchedNothing wraps record so it notes conn3x's warning that
-// -limit matched no host.
-func limitMatchedNothing(record func(conn3xexec.Event) error, none *bool) func(conn3xexec.Event) error {
+// limitUnmatched notes, from conn3x's warnings, whether an event's -limit
+// matched no host at all, and which "=host" terms matched none even when
+// others did (Conn3x v0.26.0 and later name each).
+type limitUnmatched struct {
+	none  bool
+	terms []string
+}
+
+func (u *limitUnmatched) watch(record func(conn3xexec.Event) error) func(conn3xexec.Event) error {
 	return func(ev conn3xexec.Event) error {
-		if ev.Diagnostic != nil && ev.Diagnostic.Summary == "-limit matched no host" {
-			*none = true
+		if d := ev.Diagnostic; d != nil {
+			if d.Summary == "-limit matched no host" {
+				u.none = true
+			}
+			if t, ok := strings.CutPrefix(d.Summary, "-limit term ="); ok {
+				if host, ok := strings.CutSuffix(t, " matched no host"); ok {
+					u.terms = append(u.terms, host)
+				}
+			}
 		}
 		return record(ev)
 	}
+}
+
+// err is why the run fails when some of the alert's hosts weren't checked,
+// or nil. A run that checked web1 but not ghost isn't "no drift" for both.
+func (u *limitUnmatched) err(limit []string) error {
+	switch {
+	case len(limit) == 0:
+		return nil
+	case u.none:
+		return ErrNoHost
+	case len(u.terms) > 0:
+		return fmt.Errorf("the alert names hosts this project doesn't have: %s. They weren't checked, so the run can't say they have no drift", strings.Join(u.terms, ", "))
+	}
+	return nil
 }
 
 // ErrLocalState is a configuration without a remote backend.
@@ -531,13 +558,13 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	}
 	args := append([]string{"plan", "-input=false", "-out=plan.bin"}, limit...)
 	r.note(id, "conn3x "+strings.Join(args, " "))
-	var noHost bool
-	planErr := c.Run(ctx, limitMatchedNothing(r.record(id), &noHost), args[0], args[1:]...)
+	var unmatched limitUnmatched
+	planErr := c.Run(ctx, unmatched.watch(r.record(id)), args[0], args[1:]...)
 	if planErr != nil {
 		return fmt.Errorf("plan: %w", planErr)
 	}
-	if noHost && len(limit) > 0 {
-		return ErrNoHost
+	if err := unmatched.err(limit); err != nil {
+		return err
 	}
 	dir := filepath.Dir(r.PlanFile(id))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -581,8 +608,8 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	args := append([]string{"plan", "-refresh-only", "-detailed-exitcode", "-input=false", "-out=plan.bin"}, limit...)
 	r.note(id, "conn3x "+strings.Join(args, " "))
 	outcome := store.OutcomeClean
-	var noHost bool
-	err = c.Run(ctx, limitMatchedNothing(r.record(id), &noHost), args[0], args[1:]...)
+	var unmatched limitUnmatched
+	err = c.Run(ctx, unmatched.watch(r.record(id)), args[0], args[1:]...)
 	var exit *conn3xexec.ExitError
 	if errors.As(err, &exit) && exit.Code == 2 {
 		outcome, err = store.OutcomeDrift, nil
@@ -590,8 +617,8 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	if err != nil {
 		return fmt.Errorf("plan: %w", err)
 	}
-	if noHost && len(limit) > 0 {
-		return ErrNoHost
+	if err := unmatched.err(limit); err != nil {
+		return err
 	}
 	r.saveFacts(ctx, id, p, c)
 	return r.Store.SetRunOutcome(context.Background(), id, outcome)
