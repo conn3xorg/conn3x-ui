@@ -87,9 +87,20 @@ type FleetHost struct {
 type FactMatch struct{ Name, Value string }
 
 // Hosts lists the hosts userID can see whose facts match every one of
-// match, by host and project.
+// match, by host and project. It reads every visible host's facts.
 func (s *Store) Hosts(ctx context.Context, userID int64, match []FactMatch) ([]FleetHost, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT host, project_id, (SELECT name FROM projects WHERE id = project_id), source, facts, at FROM host_facts WHERE "+visible+" ORDER BY host, project_id, source", userID)
+	return s.hosts(ctx, userID, "", match)
+}
+
+// Host is what the store knows about one host, in each project userID can
+// see that knows it, reading only that host's facts.
+func (s *Store) Host(ctx context.Context, userID int64, host string) ([]FleetHost, error) {
+	return s.hosts(ctx, userID, host, nil)
+}
+
+// hosts is Hosts, limited to one host when host isn't "".
+func (s *Store) hosts(ctx context.Context, userID int64, host string, match []FactMatch) ([]FleetHost, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT host, project_id, (SELECT name FROM projects WHERE id = project_id), source, facts, at FROM host_facts WHERE "+visible+" AND (?2 = '' OR host = ?2) ORDER BY host, project_id, source", userID, host)
 	if err != nil {
 		return nil, err
 	}
@@ -194,4 +205,37 @@ func (s *Store) PruneStepResults(ctx context.Context, cutoff string) (int64, err
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// HostSummary is one host in one project as the hosts page lists it, read
+// without decoding its facts.
+type HostSummary struct {
+	Host     string
+	Project  string
+	OS       string
+	Packages int
+	At       string
+}
+
+// HostSummaries lists every host userID can see, with its OS and package
+// count worked out in SQL, so the hosts page doesn't decode every fact.
+func (s *Store) HostSummaries(ctx context.Context, userID int64) ([]HostSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT host, (SELECT name FROM projects WHERE id = project_id),
+		COALESCE(MAX(CASE source WHEN 'conn3x_host' THEN trim(COALESCE(json_extract(facts, '$.os_id'), '') || ' ' || COALESCE(json_extract(facts, '$.os_version'), '')) END), ''),
+		COALESCE(MAX(CASE source WHEN 'conn3x_packages' THEN (SELECT count(*) FROM json_each(facts, '$.packages')) END), 0),
+		MAX(at)
+		FROM host_facts WHERE `+visible+` GROUP BY host, project_id ORDER BY host, project_id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HostSummary
+	for rows.Next() {
+		var h HostSummary
+		if err := rows.Scan(&h.Host, &h.Project, &h.OS, &h.Packages, &h.At); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
