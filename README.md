@@ -249,6 +249,8 @@ Not yet: keeping parts of an event out of the run page.
 - **Step results.** Every step an apply ran on every host, with its outcome and how long it took, and every step a drift check or plan found drifted.
 - **Facts.** The latest of what each project's `conn3x_host`, `conn3x_packages` and `conn3x_services` data sources read about each host, from every plan and drift check. How a fact was read, such as the `ssh` block, isn't kept, and neither is anything the plan marks sensitive.
 
+**Hosts**, in the menu, shows the same thing in the browser: every host the store knows, filtered by facts such as `os_id:rocky packages:openssl`, and for each host its facts by project and the latest 200 steps applied or found drifted there, each linked to its run.
+
 Ask it over a read-only JSON API, as yourself; you see only the projects you can view. For a script, make an **API token** on your **Account** page: name it, give it 1 to 365 days, and copy it, since it's shown once. Send it as a bearer token:
 
 ```sh

@@ -1,0 +1,20 @@
+{{define "title"}}Hosts{{end}}
+{{define "content"}}
+<h1>Hosts</h1>
+<p>Every host a plan or drift check you can see has read facts about, from <code>conn3x_host</code>, <code>conn3x_packages</code> and <code>conn3x_services</code> data sources.</p>
+<form method="get" action="/hosts" style="display:flex; gap:.75rem; align-items:end; flex-wrap:wrap">
+  <span><label for="facts">Facts</label>
+  <input id="facts" name="facts" value="{{.Data.Facts}}" placeholder="os_id:rocky packages:openssl" size="40"></span>
+  <button>Filter</button>
+</form>
+<small>Each <code>name:value</code> must match: a fact's value, or a key of a map fact, so <code>packages:openssl</code> finds hosts with openssl installed.</small>
+{{if .Data.Hosts}}
+<table>
+  <tr><th>Host</th><th>Projects</th><th>OS</th><th>Packages</th><th>Facts read</th></tr>
+  {{range .Data.Hosts}}
+  <tr><td class="act"><a href="/hosts/{{.Host}}">{{.Host}}</a></td><td>{{range $i, $p := .Projects}}{{if $i}}, {{end}}{{$p}}{{end}}</td>
+    <td>{{.OS}}</td><td>{{if .Packages}}{{.Packages}}{{end}}</td><td>{{.At}}</td></tr>
+  {{end}}
+</table>
+{{else}}<p>No hosts match.</p>{{end}}
+{{end}}
