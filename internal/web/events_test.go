@@ -40,7 +40,7 @@ func hookPost(t *testing.T, base string, ruleID int64, body string, h map[string
 func signed(secret []byte, body, delivery string, at time.Time) map[string]string {
 	ts := strconv.FormatInt(at.Unix(), 10)
 	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(ts + "." + body))
+	mac.Write([]byte(ts + "." + delivery + "." + body))
 	return map[string]string{"X-Conn3x-Timestamp": ts, "X-Conn3x-Delivery": delivery, "X-Conn3x-Signature": "sha256=" + hex.EncodeToString(mac.Sum(nil))}
 }
 
@@ -93,6 +93,13 @@ func TestEventRules(t *testing.T) {
 	}
 	if code, _ := hookPost(t, e.base, anyRule.ID, "{}", signed(secret, "{}", "d1", now)); code != http.StatusConflict {
 		t.Errorf("replay: %d, want 409", code)
+	}
+	// A captured request sent again under a new delivery ID no longer
+	// matches its signature.
+	replay := signed(secret, "{}", "d1", now)
+	replay["X-Conn3x-Delivery"] = "d1-again"
+	if code, _ := hookPost(t, e.base, anyRule.ID, "{}", replay); code != http.StatusUnauthorized {
+		t.Errorf("replay under a new delivery ID: %d, want 401", code)
 	}
 	if code, out := hookPost(t, e.base, anyRule.ID, "{}", signed(secret, "{}", "d2", now)); code != http.StatusAccepted || out["result"] != "folded" {
 		t.Errorf("inside the debounce: %d %v", code, out)
