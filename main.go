@@ -16,8 +16,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,22 +44,27 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "rotate-key" {
 		fs := flag.NewFlagSet("rotate-key", flag.ExitOnError)
 		data := fs.String("data", "data", "directory with the database")
-		oldFile := fs.String("old-key-file", "", "file with the key the credentials are sealed with now; or set "+keyEnv)
-		newFile := fs.String("new-key-file", "", "file with the key to seal them with from now on; or set "+newKeyEnv)
+		var oldKey, newKey keySource
+		fs.StringVar(&oldKey.file, "old-key-file", "", "file with the key the credentials are sealed with now; or set "+keyEnv)
+		fs.StringVar(&oldKey.command, "old-key-command", "", "command that prints that key, such as a KMS decrypt, in place of -old-key-file")
+		fs.StringVar(&newKey.file, "new-key-file", "", "file with the key to seal them with from now on; or set "+newKeyEnv)
+		fs.StringVar(&newKey.command, "new-key-command", "", "command that prints the new key, in place of -new-key-file")
 		fs.Parse(os.Args[2:])
-		if err := rotateKey(*data, *oldFile, *newFile); err != nil {
+		if err := rotateKey(*data, oldKey, newKey); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-public-url URL] [-smtp-addr HOST:PORT -smtp-from ADDR ...] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...] [-github-client-id ID -github-org ORG -github-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
+		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE | -key-command CMD] [-public-url URL] [-smtp-addr HOST:PORT -smtp-from ADDR ...] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...] [-github-client-id ID -github-org ORG -github-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] (-old-key-file FILE | -old-key-command CMD) (-new-key-file FILE | -new-key-command CMD)\n       conn3x-ui version")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	listen := fs.String("listen", "127.0.0.1:8080", "address to listen on")
 	data := fs.String("data", "data", "directory for the database and saved plans")
-	keyFile := fs.String("key-file", "", "file with the base64 key that encrypts credentials; or set "+keyEnv)
+	var key keySource
+	fs.StringVar(&key.file, "key-file", "", "file with the base64 key that encrypts credentials; or set "+keyEnv)
+	fs.StringVar(&key.command, "key-command", "", "command that prints the base64 key, such as a KMS decrypt, in place of -key-file")
 	var oc oidcConfig
 	fs.StringVar(&oc.issuer, "oidc-issuer", "", "OIDC provider's issuer URL; turns on single sign-on")
 	fs.StringVar(&oc.clientID, "oidc-client-id", "", "OIDC client ID")
@@ -93,7 +100,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := serve(*listen, *data, *keyFile, *publicURL, oc, gc, mailer, *retention, sandboxed); err != nil {
+	if err := serve(*listen, *data, key, *publicURL, oc, gc, mailer, *retention, sandboxed); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -105,14 +112,27 @@ const (
 	newKeyEnv = "CONN3X_UI_NEW_KEY"
 )
 
-// loadKey reads the credentials key from file, or from env when file is
+// keySource is where a credentials key comes from: a file, or a command
+// that prints it, such as a KMS decrypt of a data key kept beside the UI.
+type keySource struct{ file, command string }
+
+// loadKey reads the credentials key from src, or from env when src is
 // empty, and takes env out of the environment so no run inherits it. No
 // key at all is nil: the UI runs without credentials.
-func loadKey(file, env string) ([]byte, error) {
+func loadKey(src keySource, env string) ([]byte, error) {
 	b64 := os.Getenv(env)
 	os.Unsetenv(env)
-	if file != "" {
-		b, err := os.ReadFile(file)
+	switch {
+	case src.file != "" && src.command != "":
+		return nil, errors.New("give the credentials key as a file or a command, not both")
+	case src.file != "":
+		b, err := os.ReadFile(src.file)
+		if err != nil {
+			return nil, err
+		}
+		b64 = string(b)
+	case src.command != "":
+		b, err := keyCommandOutput(src.command)
 		if err != nil {
 			return nil, err
 		}
@@ -127,6 +147,28 @@ func loadKey(file, env string) ([]byte, error) {
 		return nil, errors.New("the credentials key must be 32 random bytes in base64. Make one with openssl rand -base64 32")
 	}
 	return key, nil
+}
+
+// keyCommandOutput runs command in the shell and returns what it prints.
+// Its errors go to stderr, where a cloud CLI says what's wrong; neither key
+// variable reaches it.
+func keyCommandOutput(command string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	shell, flag := "sh", "-c"
+	if runtime.GOOS == "windows" {
+		shell, flag = "cmd", "/C"
+	}
+	cmd := exec.CommandContext(ctx, shell, flag, command)
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, keyEnv+"=") || strings.HasPrefix(kv, newKeyEnv+"=")
+	})
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("the key command failed: %w", err)
+	}
+	return out, nil
 }
 
 // oidcConfig is the serve flags for single sign-on.
@@ -243,17 +285,17 @@ func setupGitHub(gc githubConfig) (*web.GitHub, error) {
 
 // rotateKey re-seals every credential in data's database under the new
 // key. Run it with the UI stopped: one still running has the old key.
-func rotateKey(data, oldFile, newFile string) error {
-	oldKey, err := loadKey(oldFile, keyEnv)
+func rotateKey(data string, oldSrc, newSrc keySource) error {
+	oldKey, err := loadKey(oldSrc, keyEnv)
 	if err != nil {
 		return err
 	}
-	newKey, err := loadKey(newFile, newKeyEnv)
+	newKey, err := loadKey(newSrc, newKeyEnv)
 	if err != nil {
 		return err
 	}
 	if oldKey == nil || newKey == nil {
-		return errors.New("rotate-key needs the old key, from -old-key-file or " + keyEnv + ", and the new one, from -new-key-file or " + newKeyEnv)
+		return errors.New("rotate-key needs the old key, from -old-key-file, -old-key-command or " + keyEnv + ", and the new one, from -new-key-file, -new-key-command or " + newKeyEnv)
 	}
 	path := filepath.Join(data, "conn3x-ui.db")
 	if _, err := os.Stat(path); err != nil {
@@ -306,13 +348,13 @@ func (mc mailConfig) mailer() (*mail.Mailer, error) {
 	return &mail.Mailer{Addr: mc.addr, From: from[0], User: mc.user, Password: pw}, nil
 }
 
-func serve(listen, data, keyFile, publicURL string, oc oidcConfig, gc githubConfig, mailer *mail.Mailer, retention time.Duration, sandboxed bool) error {
+func serve(listen, data string, keySrc keySource, publicURL string, oc oidcConfig, gc githubConfig, mailer *mail.Mailer, retention time.Duration, sandboxed bool) error {
 	if publicURL != "" {
 		if u, err := url.Parse(publicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("-public-url must be an http or https URL, such as https://conn3x.example.com")
 		}
 	}
-	key, err := loadKey(keyFile, keyEnv)
+	key, err := loadKey(keySrc, keyEnv)
 	if err != nil {
 		return err
 	}

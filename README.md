@@ -70,6 +70,39 @@ Credentials need a key. Without one the UI runs, but won't save or use them:
 
 Or put the same base64 in `CONN3X_UI_KEY` instead of `-key-file`; the flag wins when both are set. The UI takes the variable out of its environment once it's read, so no run inherits it. Keep the key apart from `-data`'s backups: one without the other opens nothing. Lose the key and the saved credentials are gone; set them again.
 
+### The key from a KMS or a secret store
+
+`-key-command` runs a command and takes the key from what it prints, so the key can live in a KMS or a secret store and never sit on disk in the clear. Give `-key-file` or `-key-command`, not both; either wins over `CONN3X_UI_KEY`. The command runs in `sh -c` (`cmd /C` on Windows) as the UI's user, gets a minute, and sees neither key variable. What it prints on stderr goes to the UI's stderr, beside the log, so a cloud CLI's error shows there.
+
+With AWS KMS, keep the key encrypted beside the UI:
+
+```sh
+(umask 077; openssl rand -base64 32 > conn3x-ui.key)
+aws kms encrypt --key-id alias/conn3x-ui --plaintext fileb://conn3x-ui.key \
+  --query CiphertextBlob --output text | base64 -d > conn3x-ui.key.enc
+rm conn3x-ui.key
+./conn3x-ui serve -data ./data -key-command \
+  'aws kms decrypt --ciphertext-blob fileb://conn3x-ui.key.enc --query Plaintext --output text | base64 -d'
+```
+
+With Google Cloud KMS, the same, with `gcloud`:
+
+```sh
+gcloud kms encrypt --location global --keyring conn3x --key ui \
+  --plaintext-file conn3x-ui.key --ciphertext-file conn3x-ui.key.enc
+./conn3x-ui serve -data ./data -key-command \
+  'gcloud kms decrypt --location global --keyring conn3x --key ui --ciphertext-file conn3x-ui.key.enc --plaintext-file -'
+```
+
+With Azure Key Vault, keep the key as a secret:
+
+```sh
+./conn3x-ui serve -data ./data -key-command \
+  'az keyvault secret show --vault-name my-vault --name conn3x-ui-key --query value --output tsv'
+```
+
+The same works for anything with a CLI that prints a secret, such as `bao kv get -field=key secret/conn3x-ui` or `op read op://ops/conn3x-ui/key`. The machine the UI runs on needs the right to decrypt or read, and nothing more: an instance role, a workload identity or a managed identity, rather than a long-lived cloud key.
+
 At start, the UI opens one saved credential with the key. If it won't open, the UI doesn't start, so a wrong key shows up now and not at the first run that needs it. Start without a key while credentials are saved and the log says how many, and that their projects' runs will fail until the key is back.
 
 To move to a new key, stop the UI, then re-seal every credential under it:
@@ -80,7 +113,7 @@ To move to a new key, stop the UI, then re-seal every credential under it:
 mv conn3x-ui.key.new conn3x-ui.key
 ```
 
-`CONN3X_UI_KEY` and `CONN3X_UI_NEW_KEY` work in place of the two flags. It's one transaction: if the old key doesn't open every credential, nothing changes. The audit log records the rotation with a count, never a key or a value. Start the UI with the new key; the old one opens nothing any more, but backups of `-data` made before the rotation still need it.
+`CONN3X_UI_KEY` and `CONN3X_UI_NEW_KEY` work in place of the two flags, and so do `-old-key-command` and `-new-key-command`, so a key can move from a file to a KMS, or from one KMS key to another. It's one transaction: if the old key doesn't open every credential, nothing changes. The audit log records the rotation with a count, never a key or a value. Start the UI with the new key; the old one opens nothing any more, but backups of `-data` made before the rotation still need it.
 
 Listening on anything other than localhost? Put TLS in front. The session cookie is marked Secure off localhost, so plain http to another machine won't sign you in.
 
@@ -427,7 +460,7 @@ The rest of the design, in the order it's planned:
 - Sign-in providers beyond one OIDC provider and GitHub: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, GitHub sign-in, roles per person, per OIDC group and per GitHub team, and the audit log and its export are in.
 - apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
-Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).
+Credentials are in, with the key from a file, a variable or a command such as a KMS decrypt, a key check at start, and rotation.
 
 Until then, treat it as a lab tool: runs on the UI's own host.
 
