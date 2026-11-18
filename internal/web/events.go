@@ -203,7 +203,8 @@ func matchingAlerts(e store.EventRule, body []byte) ([]map[string]string, bool) 
 }
 
 // eventInput is what a run takes from the alerts that matched: the hosts
-// in the rule's limit label, joined for -limit, and its variables. Each
+// in the rule's limit label, joined for -limit as "=" terms, so each is
+// that host by its exact name and never a group, and its variables. Each
 // limit value is one host name, a port after it dropped, and the alerts
 // must agree on each variable. It says why when they don't.
 func eventInput(e store.EventRule, alerts []map[string]string) (store.EventInput, string) {
@@ -224,7 +225,7 @@ func eventInput(e store.EventRule, alerts []map[string]string) (store.EventInput
 			}
 			if !seen[h] {
 				seen[h] = true
-				hosts = append(hosts, h)
+				hosts = append(hosts, "="+h)
 			}
 		}
 		in.Limit = strings.Join(hosts, ",")
