@@ -300,7 +300,7 @@ func TestEventLimitAndVars(t *testing.T) {
 	e.runner.Wait()
 	runID := int64(out["run"].(float64))
 	in, err := e.st.RunEventInput(ctx, runID)
-	if err != nil || in.Limit != "web1,web2" || fmt.Sprint(in.Env) != "[TF_VAR_mount=/var]" {
+	if err != nil || in.Limit != "=web1,=web2" || fmt.Sprint(in.Env) != "[TF_VAR_mount=/var]" {
 		t.Errorf("input %+v, %v", in, err)
 	}
 	lines, _, err := e.st.Events(ctx, runID)
@@ -312,7 +312,7 @@ func TestEventLimitAndVars(t *testing.T) {
 		log.Write(l)
 		log.WriteByte('\n')
 	}
-	if !strings.Contains(log.String(), "-limit=web1,web2") {
+	if !strings.Contains(log.String(), "-limit==web1,=web2") {
 		t.Errorf("the run didn't plan with -limit:\n%s", log.String())
 	}
 }
