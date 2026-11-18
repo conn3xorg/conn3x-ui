@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
@@ -86,9 +87,23 @@ func TestKeyCommand(t *testing.T) {
 		t.Errorf("failing command: %v", err)
 	}
 	if runtime.GOOS != "windows" {
-		out, _ := keyCommandOutput("echo \"[$" + newKeyEnv + "]\"")
+		t.Setenv(oidcSecretEnv, "not-for-the-command")
+		out, _ := keyCommandOutput("echo \"[$" + newKeyEnv + "$" + oidcSecretEnv + "]\"")
 		if string(out) != "[]\n" {
-			t.Errorf("the command saw %s: %q", newKeyEnv, out)
+			t.Errorf("the command saw a CONN3X_UI_ secret: %q", out)
+		}
+
+		// A pipeline whose first command hangs, as a KMS call on a dead
+		// network would, still ends at the timeout.
+		was := keyCommandTimeout
+		keyCommandTimeout = time.Second
+		defer func() { keyCommandTimeout = was }()
+		start := time.Now()
+		if _, err := keyCommandOutput("sleep 60 | cat"); err == nil {
+			t.Error("a hung command succeeded")
+		}
+		if d := time.Since(start); d > 10*time.Second {
+			t.Errorf("a hung pipeline held for %s", d)
 		}
 	}
 }

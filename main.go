@@ -149,21 +149,27 @@ func loadKey(src keySource, env string) ([]byte, error) {
 	return key, nil
 }
 
+// keyCommandTimeout bounds a key command; a test shortens it.
+var keyCommandTimeout = time.Minute
+
 // keyCommandOutput runs command in the shell and returns what it prints.
-// Its errors go to stderr, where a cloud CLI says what's wrong; neither key
-// variable reaches it.
+// Its errors go to stderr, where a cloud CLI says what's wrong. No
+// CONN3X_UI_ variable reaches it, so it sees no key and no other secret.
+// At the timeout the whole process group is killed, and WaitDelay stops
+// waiting on a pipe a child still holds, so a hung KMS call can't hold
+// startup past it.
 func keyCommandOutput(command string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), keyCommandTimeout)
 	defer cancel()
 	shell, flag := "sh", "-c"
 	if runtime.GOOS == "windows" {
 		shell, flag = "cmd", "/C"
 	}
 	cmd := exec.CommandContext(ctx, shell, flag, command)
-	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, keyEnv+"=") || strings.HasPrefix(kv, newKeyEnv+"=")
-	})
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "CONN3X_UI_") })
 	cmd.Stderr = os.Stderr
+	cmd.WaitDelay = 5 * time.Second
+	killGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("the key command failed: %w", err)
