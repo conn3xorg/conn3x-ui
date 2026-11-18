@@ -1,2 +1,18 @@
 # Default owner for everything in the repository.
 * @jamesconwaydev
+
+# Sign-in, sessions, API tokens and the hooks that start runs without a
+# person, the credentials key and what it seals, and the run sandbox. A
+# change to any of these needs a second maintainer's review. Later lines
+# win, so each path lists both owners: the one who didn't write the change
+# reviews it.
+/internal/web/server.go @jamesconwaydev @foothillsdigital
+/internal/web/oidc.go @jamesconwaydev @foothillsdigital
+/internal/web/events.go @jamesconwaydev @foothillsdigital
+/internal/store/tokens.go @jamesconwaydev @foothillsdigital
+/internal/store/events.go @jamesconwaydev @foothillsdigital
+/internal/store/store.go @jamesconwaydev @foothillsdigital
+/internal/sandbox/ @jamesconwaydev @foothillsdigital
+/internal/run/runner.go @jamesconwaydev @foothillsdigital
+/main.go @jamesconwaydev @foothillsdigital
+/.github/workflows/ @jamesconwaydev @foothillsdigital
