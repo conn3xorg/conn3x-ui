@@ -223,7 +223,7 @@ receivers:
             credentials_file: /etc/alertmanager/conn3x-hook-3
 ```
 
-Anything else signs each request. Send `X-Conn3x-Timestamp`, the time in Unix seconds, a unique `X-Conn3x-Delivery`, and `X-Conn3x-Signature: sha256=` followed by the hex HMAC-SHA256 of the timestamp, a dot, the delivery ID, a dot and the body, keyed with the secret:
+Anything else signs each request. Send `X-Conn3x-Timestamp`, the time in Unix seconds, a unique `X-Conn3x-Delivery` of up to 128 letters, digits, `-` and `_`, and `X-Conn3x-Signature: sha256=` followed by the hex HMAC-SHA256 of the timestamp, a dot, the delivery ID, a dot and the body, keyed with the secret:
 
 ```sh
 ts=$(date +%s); id=$(uuidgen); body='{"reason":"deploy finished"}'

@@ -101,6 +101,17 @@ func TestEventRules(t *testing.T) {
 	if code, _ := hookPost(t, e.base, anyRule.ID, "{}", replay); code != http.StatusUnauthorized {
 		t.Errorf("replay under a new delivery ID: %d, want 401", code)
 	}
+	// Moving text from the body into the ID across a dot keeps the joined
+	// string the same, so an ID with a dot is refused.
+	body := `{"v":"1.2"}`
+	shifted := signed(secret, body, "d5", now)
+	shifted["X-Conn3x-Delivery"] = `d5.{"v":"1`
+	if code, _ := hookPost(t, e.base, anyRule.ID, `2"}`, shifted); code != http.StatusUnauthorized {
+		t.Errorf("text moved from the body into the ID: %d, want 401", code)
+	}
+	if code, _ := hookPost(t, e.base, anyRule.ID, "{}", signed(secret, "{}", "d.6", now)); code != http.StatusUnauthorized {
+		t.Errorf("a delivery ID with a dot: %d, want 401", code)
+	}
 	if code, out := hookPost(t, e.base, anyRule.ID, "{}", signed(secret, "{}", "d2", now)); code != http.StatusAccepted || out["result"] != "folded" {
 		t.Errorf("inside the debounce: %d %v", code, out)
 	}
