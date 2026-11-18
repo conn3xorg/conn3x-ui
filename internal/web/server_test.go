@@ -93,6 +93,11 @@ func TestMain(m *testing.M) {
 	case "plan":
 		// A -limit naming a host it doesn't have matches nothing, as conn3x
 		// warns, and a plan finds no changes.
+		// A -limit with a host it has and one it hasn't plans the first, and
+		// names the other, as Conn3x v0.26.0 does.
+		if slices.ContainsFunc(os.Args, func(a string) bool { return strings.Contains(a, "=phantom") }) {
+			fmt.Println(`{"@level":"warn","@message":"Warning: -limit term =phantom matched no host","type":"diagnostic","diagnostic":{"severity":"warning","summary":"-limit term =phantom matched no host","detail":""}}`)
+		}
 		if slices.ContainsFunc(os.Args, func(a string) bool { return strings.Contains(a, "ghost") }) {
 			fmt.Println(`{"@level":"warn","@message":"Warning: -limit matched no host","type":"diagnostic","diagnostic":{"severity":"warning","summary":"-limit matched no host","detail":""}}`)
 			return
