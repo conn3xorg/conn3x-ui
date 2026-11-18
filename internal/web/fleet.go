@@ -4,6 +4,7 @@
 package web
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -46,28 +47,39 @@ func (s *Server) hostsPage(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, "hosts", http.StatusBadRequest, d, bad)
 		return
 	}
-	hosts, err := s.Store.Hosts(r.Context(), viewer(r), match)
+	// The summaries come from SQL without decoding a fact; a filter has to
+	// read the facts, but only to pick hosts.
+	all, err := s.Store.HostSummaries(r.Context(), viewer(r))
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
+	var keep map[string]bool
+	if len(match) > 0 {
+		hosts, err := s.Store.Hosts(r.Context(), viewer(r), match)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		keep = map[string]bool{}
+		for _, h := range hosts {
+			keep[h.Host+"\x00"+h.Project] = true
+		}
+	}
 	rows := map[string]*hostRow{}
-	for _, h := range hosts {
+	for _, h := range all {
+		if keep != nil && !keep[h.Host+"\x00"+h.Project] {
+			continue
+		}
 		row := rows[h.Host]
 		if row == nil {
 			row = &hostRow{Host: h.Host}
 			rows[h.Host] = row
 		}
 		row.Projects = append(row.Projects, h.Project)
-		if facts := h.Facts["conn3x_host"]; facts != nil && row.OS == "" {
-			row.OS = strings.TrimSpace(fmt.Sprint(facts["os_id"]) + " " + fmt.Sprint(facts["os_version"]))
-		}
-		if pkgs, ok := h.Facts["conn3x_packages"]["packages"].(map[string]any); ok && len(pkgs) > row.Packages {
-			row.Packages = len(pkgs)
-		}
-		if h.At > row.At {
-			row.At = h.At
-		}
+		row.OS = cmp.Or(row.OS, h.OS)
+		row.Packages = max(row.Packages, h.Packages)
+		row.At = max(row.At, h.At)
 	}
 	list := make([]*hostRow, 0, len(rows))
 	for _, row := range rows {
@@ -88,16 +100,13 @@ type hostFacts struct {
 
 func (s *Server) hostPage(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
-	hosts, err := s.Store.Hosts(r.Context(), viewer(r), nil)
+	hosts, err := s.Store.Host(r.Context(), viewer(r), host)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	var facts []hostFacts
 	for _, h := range hosts {
-		if h.Host != host {
-			continue
-		}
 		hf := hostFacts{Project: h.Project, At: h.At, Sources: map[string]string{}}
 		for source, f := range h.Facts {
 			b, _ := json.MarshalIndent(f, "", "  ")
