@@ -79,7 +79,7 @@ type page struct {
 // New builds the handler.
 func New(st *store.Store, rn *run.Runner) *Server {
 	s := &Server{Store: st, Runner: rn, Log: log.Default(), pages: map[string]*template.Template{}, mux: http.NewServeMux()}
-	for _, name := range []string{"login", "projects", "project", "run", "runs", "users", "account", "audit", "forbidden"} {
+	for _, name := range []string{"login", "projects", "project", "run", "runs", "users", "account", "audit", "forbidden", "hosts", "host"} {
 		s.pages[name] = template.Must(template.New("").Funcs(template.FuncMap{"lineText": lineText, "credEnv": run.CredentialEnv, "atLeast": store.RoleAtLeast, "roles": func() []string { return store.Roles }}).
 			ParseFS(files, "templates/layout.html", "templates/project_form.html", "templates/"+name+".html"))
 	}
@@ -121,6 +121,8 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /account/tokens/{id}/delete", s.deleteToken)
 	s.mux.HandleFunc("GET /audit", s.auditPage)
 	s.mux.HandleFunc("GET /audit/export", s.auditExport)
+	s.mux.HandleFunc("GET /hosts", s.hostsPage)
+	s.mux.HandleFunc("GET /hosts/{host}", s.hostPage)
 	s.mux.HandleFunc("GET /api/v1/hosts", s.apiHosts)
 	s.mux.HandleFunc("GET /api/v1/hosts/{host}/changes", s.apiHostChanges)
 	s.mux.HandleFunc("GET /api/v1/steps", s.apiSteps)
