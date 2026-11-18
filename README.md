@@ -72,7 +72,7 @@ Or put the same base64 in `CONN3X_UI_KEY` instead of `-key-file`; the flag wins 
 
 ### The key from a KMS or a secret store
 
-`-key-command` runs a command and takes the key from what it prints, so the key can live in a KMS or a secret store and never sit on disk in the clear. Give `-key-file` or `-key-command`, not both; either wins over `CONN3X_UI_KEY`. The command runs in `sh -c` (`cmd /C` on Windows) as the UI's user, gets a minute, and sees neither key variable. What it prints on stderr goes to the UI's stderr, beside the log, so a cloud CLI's error shows there.
+`-key-command` runs a command and takes the key from what it prints, so the key can live in a KMS or a secret store and never sit on disk in the clear. Give `-key-file` or `-key-command`, not both; either wins over `CONN3X_UI_KEY`. The command runs in `sh -c` (`cmd /C` on Windows) as the UI's user, gets a minute, and sees no `CONN3X_UI_` variable, so no key and no other secret. A command that hangs is killed at the minute, on Unix with every process in its pipeline. What it prints on stderr goes to the UI's stderr, beside the log, so a cloud CLI's error shows there.
 
 With AWS KMS, keep the key encrypted beside the UI:
 
