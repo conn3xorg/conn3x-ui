@@ -431,6 +431,22 @@ func (r *Runner) scrub(id int64, s string) string {
 	return h.Replace(s)
 }
 
+// ErrNoHost is an event's -limit that matched no host in the project, so
+// the run looked at nothing. Recording that as clean would say a host the
+// alert named had no drift when it was never checked.
+var ErrNoHost = errors.New("the alert's host isn't in this project: -limit matched no host, so nothing was checked")
+
+// limitMatchedNothing wraps record so it notes conn3x's warning that
+// -limit matched no host.
+func limitMatchedNothing(record func(conn3xexec.Event) error, none *bool) func(conn3xexec.Event) error {
+	return func(ev conn3xexec.Event) error {
+		if ev.Diagnostic != nil && ev.Diagnostic.Summary == "-limit matched no host" {
+			*none = true
+		}
+		return record(ev)
+	}
+}
+
 // ErrLocalState is a configuration without a remote backend.
 var ErrLocalState = errors.New("this configuration keeps its state in a local file, which would be lost with the run's temp directory. " +
 	"conn3x-ui needs a remote backend, such as s3, azurerm, gcs, pg or http. Add a backend block to the configuration and plan again")
@@ -515,9 +531,13 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	}
 	args := append([]string{"plan", "-input=false", "-out=plan.bin"}, limit...)
 	r.note(id, "conn3x "+strings.Join(args, " "))
-	planErr := c.Run(ctx, r.record(id), args[0], args[1:]...)
+	var noHost bool
+	planErr := c.Run(ctx, limitMatchedNothing(r.record(id), &noHost), args[0], args[1:]...)
 	if planErr != nil {
 		return fmt.Errorf("plan: %w", planErr)
+	}
+	if noHost && len(limit) > 0 {
+		return ErrNoHost
 	}
 	dir := filepath.Dir(r.PlanFile(id))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -561,13 +581,17 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	args := append([]string{"plan", "-refresh-only", "-detailed-exitcode", "-input=false", "-out=plan.bin"}, limit...)
 	r.note(id, "conn3x "+strings.Join(args, " "))
 	outcome := store.OutcomeClean
-	err = c.Run(ctx, r.record(id), args[0], args[1:]...)
+	var noHost bool
+	err = c.Run(ctx, limitMatchedNothing(r.record(id), &noHost), args[0], args[1:]...)
 	var exit *conn3xexec.ExitError
 	if errors.As(err, &exit) && exit.Code == 2 {
 		outcome, err = store.OutcomeDrift, nil
 	}
 	if err != nil {
 		return fmt.Errorf("plan: %w", err)
+	}
+	if noHost && len(limit) > 0 {
+		return ErrNoHost
 	}
 	r.saveFacts(ctx, id, p, c)
 	return r.Store.SetRunOutcome(context.Background(), id, outcome)
