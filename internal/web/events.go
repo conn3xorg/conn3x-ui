@@ -24,8 +24,11 @@ const hookWindow = 5 * time.Minute
 const hookMaxBody = 1 << 20
 
 var (
-	ruleName  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	labelName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// deliveryID has no dot, the signature's separator, so text can't move
+	// between the ID and the body and keep the same signature.
+	deliveryID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	ruleName   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	labelName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // ruleForm reads an event rule from the form, or says what's wrong with it.
@@ -111,7 +114,9 @@ func (s *Server) deleteEventRule(w http.ResponseWriter, r *http.Request) {
 
 // hookAuthorized says whether a request carries the rule's secret: a
 // bearer token, as Alertmanager sends, or an HMAC-SHA256 signature over
-// the timestamp and body with a delivery ID, as a webhook sender can.
+// the timestamp, the delivery ID and the body, as a webhook sender can.
+// The ID is signed so a captured request can't be sent again under a new
+// one.
 func hookAuthorized(r *http.Request, body, secret []byte, now time.Time) (signed bool, ok bool) {
 	want := hex.EncodeToString(secret)
 	if tok, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); found {
@@ -119,7 +124,7 @@ func hookAuthorized(r *http.Request, body, secret []byte, now time.Time) (signed
 	}
 	sig, found := strings.CutPrefix(r.Header.Get("X-Conn3x-Signature"), "sha256=")
 	ts := r.Header.Get("X-Conn3x-Timestamp")
-	if !found || ts == "" || r.Header.Get("X-Conn3x-Delivery") == "" {
+	if !found || ts == "" || !deliveryID.MatchString(r.Header.Get("X-Conn3x-Delivery")) {
 		return true, false
 	}
 	sec, err := strconv.ParseInt(ts, 10, 64)
@@ -130,7 +135,7 @@ func hookAuthorized(r *http.Request, body, secret []byte, now time.Time) (signed
 		return true, false
 	}
 	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(ts + "."))
+	mac.Write([]byte(ts + "." + r.Header.Get("X-Conn3x-Delivery") + "."))
 	mac.Write(body)
 	return true, hmac.Equal([]byte(sig), []byte(hex.EncodeToString(mac.Sum(nil))))
 }

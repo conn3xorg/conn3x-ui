@@ -223,13 +223,13 @@ receivers:
             credentials_file: /etc/alertmanager/conn3x-hook-3
 ```
 
-Anything else signs each request. Send `X-Conn3x-Timestamp`, the time in Unix seconds, a unique `X-Conn3x-Delivery`, and `X-Conn3x-Signature: sha256=` followed by the hex HMAC-SHA256 of the timestamp, a dot and the body, keyed with the secret:
+Anything else signs each request. Send `X-Conn3x-Timestamp`, the time in Unix seconds, a unique `X-Conn3x-Delivery` of up to 128 letters, digits, `-` and `_`, and `X-Conn3x-Signature: sha256=` followed by the hex HMAC-SHA256 of the timestamp, a dot, the delivery ID, a dot and the body, keyed with the secret:
 
 ```sh
-ts=$(date +%s); body='{"reason":"deploy finished"}'
-sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
+ts=$(date +%s); id=$(uuidgen); body='{"reason":"deploy finished"}'
+sig=$(printf '%s.%s.%s' "$ts" "$id" "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
 curl -X POST https://conn3x.example.com/hooks/3 -H "X-Conn3x-Timestamp: $ts" \
-  -H "X-Conn3x-Delivery: $(uuidgen)" -H "X-Conn3x-Signature: sha256=$sig" -d "$body"
+  -H "X-Conn3x-Delivery: $id" -H "X-Conn3x-Signature: sha256=$sig" -d "$body"
 ```
 
 A timestamp more than five minutes off, a delivery ID the rule has seen, a wrong secret and a rule that doesn't exist are all refused, the last two alike. The answer is JSON: `"started"` with the run's ID, `"folded"` inside the debounce, or `"no match"`. Bodies are capped at 1 MiB.
