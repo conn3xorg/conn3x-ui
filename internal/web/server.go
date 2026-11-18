@@ -112,6 +112,8 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /users/{id}/password", s.resetPassword)
 	s.mux.HandleFunc("GET /account", s.account)
 	s.mux.HandleFunc("POST /account/password", s.changePassword)
+	s.mux.HandleFunc("POST /account/tokens", s.createToken)
+	s.mux.HandleFunc("POST /account/tokens/{id}/delete", s.deleteToken)
 	s.mux.HandleFunc("GET /audit", s.auditPage)
 	s.mux.HandleFunc("GET /audit/export", s.auditExport)
 	s.mux.HandleFunc("GET /api/v1/hosts", s.apiHosts)
@@ -142,6 +144,24 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mux.ServeHTTP(w, r)
+		return
+	}
+	// A script reads the API with a token instead of a session. It has no
+	// CSRF token, so it can only read.
+	if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && strings.HasPrefix(r.URL.Path, "/api/") {
+		if r.Method != http.MethodGet {
+			apiError(w, http.StatusMethodNotAllowed, "an API token can only read")
+			return
+		}
+		u, err := s.Store.TokenUser(r.Context(), strings.TrimSpace(tok))
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				s.Log.Printf("api token: %v", err)
+			}
+			apiError(w, http.StatusUnauthorized, "that token is unknown, expired or revoked")
+			return
+		}
+		s.mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionKey, session{user: u})))
 		return
 	}
 	sess, err := s.session(r)

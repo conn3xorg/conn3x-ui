@@ -415,7 +415,7 @@ func TestUsers(t *testing.T) {
 	// survives.
 	keep, _, _ := s.Login(ctx, "alice", "first-password", time.Hour)
 	other, _, _ := s.Login(ctx, "alice", "first-password", time.Hour)
-	if err := s.SetPassword(ctx, id, "second-password", keep); err != nil {
+	if _, err := s.SetPassword(ctx, id, "second-password", keep); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CheckPassword(ctx, id, "first-password"); !errors.Is(err, ErrNotFound) {

@@ -207,6 +207,17 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN event_rule_id INTEGER REFERENCES event_rules(id) ON DELETE SET NULL;
 	ALTER TABLE runs ADD COLUMN event_rule_name TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN event_body TEXT NOT NULL DEFAULT '';`,
+	// 14: API tokens, each a user's, kept as a SHA-256 hash.
+	`CREATE TABLE api_tokens (
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name TEXT NOT NULL,
+		hash TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		last_used_at TEXT NOT NULL DEFAULT '',
+		UNIQUE (user_id, name)
+	);`,
 }
 
 // Store is the database.
@@ -972,18 +983,26 @@ func (s *Store) SetUser(ctx context.Context, id int64, admin, disabled bool) err
 	return err
 }
 
-// SetPassword replaces a user's password and ends their sessions, all but
-// the one with token keep.
-func (s *Store) SetPassword(ctx context.Context, id int64, password, keep string) error {
+// SetPassword replaces a user's password, ends their sessions, all but
+// the one with token keep, and revokes their API tokens, since a new
+// password usually means the old ways in should stop. It returns how many
+// tokens it revoked.
+func (s *Store) SetPassword(ctx context.Context, id int64, password, keep string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash=? WHERE id=?", hashPassword(password, Token(16)), id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
-	_, err = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id=? AND token<>?", id, keep)
-	return err
+	if _, err = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id=? AND token<>?", id, keep); err != nil {
+		return 0, err
+	}
+	res, err = s.db.ExecContext(ctx, "DELETE FROM api_tokens WHERE user_id=?", id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // CheckPassword is ErrNotFound unless password is the user's.
