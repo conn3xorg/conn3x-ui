@@ -90,4 +90,11 @@ func TestSetupGitHubRefusesTeamSlugs(t *testing.T) {
 	if _, err := setupGitHub(ok); err != nil {
 		t.Errorf("team IDs: %v", err)
 	}
+	padded := base
+	padded.adminTeam = "00123"
+	padded.roles = roleFlags{{Group: "0456", Project: "web", Role: "planner"}}
+	t.Setenv(githubSecretEnv, "s")
+	if g, err := setupGitHub(padded); err != nil || g.AdminTeam != "123" || g.TeamRoles[0].Group != "456" {
+		t.Errorf("leading zeros: %+v, %v", g, err)
+	}
 }

@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -207,14 +208,21 @@ func setupGitHub(gc githubConfig) (*web.GitHub, error) {
 	if gc.redirectURL == "" {
 		return nil, errors.New("GitHub sign-in needs -github-redirect-url as well as -github-client-id")
 	}
-	teams := []string{gc.adminTeam}
-	for _, r := range gc.roles {
-		teams = append(teams, r.Group)
+	// Each ID is written back as GitHub writes it, so "0123" matches 123.
+	teams := []*string{&gc.adminTeam}
+	gc.roles = slices.Clone(gc.roles)
+	for i := range gc.roles {
+		teams = append(teams, &gc.roles[i].Group)
 	}
 	for _, t := range teams {
-		if _, err := strconv.ParseUint(t, 10, 63); t != "" && err != nil {
-			return nil, fmt.Errorf("GitHub teams are named by numeric ID, not slug, since any member can create a team with a free slug: %q. Find the ID with: gh api orgs/%s/teams/%s --jq .id", t, gc.org, t)
+		if *t == "" {
+			continue
 		}
+		id, err := strconv.ParseUint(*t, 10, 63)
+		if err != nil {
+			return nil, fmt.Errorf("GitHub teams are named by numeric ID, not slug, since any member can create a team with a free slug: %q. Find the ID with: gh api orgs/%s/teams/%s --jq .id", *t, gc.org, *t)
+		}
+		*t = strconv.FormatUint(id, 10)
 	}
 	if gc.secretFile != "" {
 		b, err := os.ReadFile(gc.secretFile)
