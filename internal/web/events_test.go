@@ -332,8 +332,9 @@ func TestEventLimitAndVars(t *testing.T) {
 		t.Errorf("an alert for a host not in the project: %+v, %v", rn, err)
 	}
 
-	// A grouped alert for web1 and a host the project lacks checks web1 but
-	// fails, naming the other, rather than reading as no drift for both.
+	// A grouped alert for web1 and a host the project lacks checks web1.
+	// web1 drifted, so that stands, with a note naming the host that wasn't
+	// checked. (A clean result fails instead: see limitUnmatched.)
 	partial, partialSecret, err := e.st.CreateEventRule(ctx, store.EventRule{ProjectID: pid, Name: "partial", Alertname: "DiskFull", LimitLabel: "instance", Vars: "mount=mountpoint", Mode: store.ModeReport, DebounceMinutes: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +345,41 @@ func TestEventLimitAndVars(t *testing.T) {
 	}
 	e.runner.Wait()
 	rn, err = e.st.Run(ctx, int64(out["run"].(float64)))
-	if err != nil || rn.Status == store.StatusSucceeded || !strings.Contains(rn.Error, "phantom") {
-		t.Errorf("an alert for web1 and a host not in the project: %+v, %v", rn, err)
+	if err != nil || rn.Status != store.StatusSucceeded || rn.Outcome != store.OutcomeDrift {
+		t.Errorf("an alert for web1, which drifted, and a host not in the project: %+v, %v", rn, err)
+	}
+	lines, _, err = e.st.Events(ctx, rn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partialLog strings.Builder
+	for _, l := range lines {
+		partialLog.Write(l)
+	}
+	if !strings.Contains(partialLog.String(), "phantom. They weren't checked") {
+		t.Errorf("the run's log doesn't name phantom")
+	}
+
+	// With no drift on web1, the run fails, with no outcome stored, so
+	// nothing shows it as clean.
+	clean, err := e.st.CreateProject(ctx, store.Project{Name: "clean", GitURL: repo, GitRef: "main", Path: ".", Conn3xPath: exe, Env: "CONN3X_FAKE=drift\nCONN3X_FAKE_WEB1=clean"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanRule, cleanSecret, err := e.st.CreateEventRule(ctx, store.EventRule{ProjectID: clean, Name: "clean", Alertname: "DiskFull", LimitLabel: "instance", Vars: "mount=mountpoint", Mode: store.ModeReport, DebounceMinutes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out = hookPost(t, e.base, cleanRule.ID, alerts([2]string{"web1:9100", "/tmp"}, [2]string{"phantom:9100", "/tmp"}), map[string]string{"Authorization": "Bearer " + hex.EncodeToString(cleanSecret)})
+	if code != http.StatusAccepted || out["result"] != "started" {
+		t.Fatalf("clean partial: %d %v", code, out)
+	}
+	e.runner.Wait()
+	rn, err = e.st.Run(ctx, int64(out["run"].(float64)))
+	if err != nil || rn.Status == store.StatusSucceeded || rn.Outcome != "" || !strings.Contains(rn.Error, "phantom") {
+		t.Errorf("an alert for web1, clean, and a host not in the project: %+v, %v", rn, err)
+	}
+	if _, body := e.get(fmt.Sprintf("/runs/%d", rn.ID)); strings.Contains(body, "No drift") {
+		t.Error("the run page says No drift for a run that didn't check phantom")
 	}
 }

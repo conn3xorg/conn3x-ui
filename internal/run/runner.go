@@ -460,18 +460,23 @@ func (u *limitUnmatched) watch(record func(conn3xexec.Event) error) func(conn3xe
 	}
 }
 
-// err is why the run fails when some of the alert's hosts weren't checked,
-// or nil. A run that checked web1 but not ghost isn't "no drift" for both.
-func (u *limitUnmatched) err(limit []string) error {
-	switch {
-	case len(limit) == 0:
-		return nil
-	case u.none:
+// none is ErrNoHost when an event's -limit matched no host at all, so the
+// run checked nothing, and nil otherwise.
+func (u *limitUnmatched) noneErr(limit []string) error {
+	if len(limit) > 0 && u.none {
 		return ErrNoHost
-	case len(u.terms) > 0:
-		return fmt.Errorf("the alert names hosts this project doesn't have: %s. They weren't checked, so the run can't say they have no drift", strings.Join(u.terms, ", "))
 	}
 	return nil
+}
+
+// partial says which of the alert's hosts weren't checked while others
+// were, or "". The hosts that were checked keep their result: drift on
+// web1 is still drift, and still corrected, when ghost isn't in the project.
+func (u *limitUnmatched) partial(limit []string) string {
+	if len(limit) == 0 || u.none || len(u.terms) == 0 {
+		return ""
+	}
+	return "the alert names hosts this project doesn't have: " + strings.Join(u.terms, ", ") + ". They weren't checked"
 }
 
 // ErrLocalState is a configuration without a remote backend.
@@ -563,8 +568,11 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	if planErr != nil {
 		return fmt.Errorf("plan: %w", planErr)
 	}
-	if err := unmatched.err(limit); err != nil {
+	if err := unmatched.noneErr(limit); err != nil {
 		return err
+	}
+	if msg := unmatched.partial(limit); msg != "" {
+		r.note(id, upperFirst(msg)+"; the plan covers the others.")
 	}
 	dir := filepath.Dir(r.PlanFile(id))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -617,11 +625,24 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	if err != nil {
 		return fmt.Errorf("plan: %w", err)
 	}
-	if err := unmatched.err(limit); err != nil {
+	if err := unmatched.noneErr(limit); err != nil {
 		return err
 	}
 	r.saveFacts(ctx, id, p, c)
-	return r.Store.SetRunOutcome(context.Background(), id, outcome)
+	// Drift on the hosts that were checked stands, and goes on to be
+	// corrected. With none, the run fails before any outcome is stored, so
+	// it never shows as clean for hosts nothing looked at.
+	msg := unmatched.partial(limit)
+	if msg != "" && outcome != store.OutcomeDrift {
+		return errors.New(msg + ", so the run can't say they have no drift")
+	}
+	if err := r.Store.SetRunOutcome(context.Background(), id, outcome); err != nil {
+		return err
+	}
+	if msg != "" {
+		r.note(id, upperFirst(msg)+"; the drift found on the others stands.")
+	}
+	return nil
 }
 
 // doApply checks out the commit plan was made from and applies its saved
