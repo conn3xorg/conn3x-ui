@@ -68,3 +68,26 @@ func TestRotateKeyCommand(t *testing.T) {
 		}
 	}
 }
+
+// GitHub teams are named by ID: a slug in a flag is refused at startup,
+// since any member can create a team with a free slug.
+func TestSetupGitHubRefusesTeamSlugs(t *testing.T) {
+	t.Setenv(githubSecretEnv, "s")
+	base := githubConfig{clientID: "c", redirectURL: "https://ui/cb", org: "acme", url: "https://github.com"}
+	admin := base
+	admin.adminTeam = "platform"
+	role := base
+	role.roles = roleFlags{{Group: "ops", Project: "web", Role: "planner"}}
+	for name, gc := range map[string]githubConfig{"-github-admin-team": admin, "-github-role": role} {
+		if _, err := setupGitHub(gc); err == nil || !strings.Contains(err.Error(), "numeric ID") {
+			t.Errorf("%s with a slug: %v", name, err)
+		}
+	}
+	ok := base
+	ok.adminTeam = "4185301"
+	ok.roles = roleFlags{{Group: "4185302", Project: "web", Role: "planner"}}
+	t.Setenv(githubSecretEnv, "s")
+	if _, err := setupGitHub(ok); err != nil {
+		t.Errorf("team IDs: %v", err)
+	}
+}
