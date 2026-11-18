@@ -2,6 +2,7 @@
 {{define "content"}}
 <h1>Sign in</h1>
 {{if .Data.OIDC}}<form method="get" action="/login/oidc"><p><button class="primary">Sign in with single sign-on</button></p></form>{{end}}
+{{if .Data.GitHub}}<form method="get" action="/login/github"><p><button class="primary">Sign in with GitHub</button></p></form>{{end}}
 {{if .Data.Password}}
 <form method="post" action="/login" style="max-width: 24rem">
   <input type="hidden" name="csrf" value="{{.CSRF}}">

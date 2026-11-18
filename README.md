@@ -377,6 +377,33 @@ The groups come from the ID token's `groups` claim; `-oidc-groups-claim` names a
 
 Once single sign-on works, you can turn off password sign-in with `-no-password-sign-in`. It won't lock you out: the UI refuses to start with it until a site admin who isn't disabled signs in with OIDC. So sign in with OIDC once, make that user a site admin under **Users** while signed in as `admin`, then restart with the flag. Starting with it signs out every session that was opened with a password, and the audit log says how many. From then on every admin signs in with OIDC, and nobody can drop their own admin, so one is always left.
 
+## Sign in with GitHub
+
+If your people already live in a GitHub organisation, they can sign in with that, on github.com or a GitHub Enterprise Server. Create an OAuth app in the organisation's settings (**Developer settings**, **OAuth Apps**), with the callback URL `https://HOST/login/github/callback`, and start the UI with it:
+
+```sh
+(umask 077; printf '%s' 'CLIENT_SECRET' > github-secret)
+./conn3x-ui serve -listen 127.0.0.1:8080 -data ./data \
+  -github-client-id Iv1.0123456789abcdef \
+  -github-client-secret-file github-secret \
+  -github-redirect-url https://conn3x.example.com/login/github/callback \
+  -github-org acme \
+  -github-admin-team 4185301 \
+  -github-role '4185302=web:approver' \
+  -github-role '4185303=web:planner'
+```
+
+The sign-in page gets a **Sign in with GitHub** button.
+
+- **`-github-org` is required.** Anyone can have a GitHub account, so only the organisation's active members get in. Someone invited but not yet accepted doesn't, and the audit log says why.
+- **Teams are named by numeric ID, not slug.** Any org member can create a team unless an owner turns that off, and a slug is free again once its team is renamed or deleted, so a slug could be claimed by someone who wants the role it grants. An ID can't. Find one with `gh api orgs/acme/teams/platform --jq .id`.
+- **Teams work like OIDC groups.** `-github-admin-team` and each `-github-role TEAM_ID=PROJECT:ROLE` name teams in `-github-org`, are checked at every sign-in, and follow the same rules as `-oidc-admin-group` and `-oidc-role` above: the highest role wins, hand-set roles stay, and the last site admin stays one.
+- **Users are tied to their GitHub ID,** not their login, so a renamed or reused login can't take over an account. A new user is named from their login.
+- **GitHub Enterprise Server:** add `-github-url https://github.example.com`. The API is then `/api/v3` there.
+- **What it reads.** The UI asks for the `read:org` scope, and reads the user, their membership in the organisation and their teams, once per sign-in. It keeps no token and logs none. The client secret comes from `-github-client-secret-file` or `CONN3X_UI_GITHUB_CLIENT_SECRET`, taken out of the environment once read.
+
+GitHub and OIDC can both be on. `-no-password-sign-in` then needs a site admin who signs in with either.
+
 ## Audit log
 
 Who did what, and when. **Audit**, for site admins, lists it newest first, 50 to a page, filtered by user and project. It records:
@@ -397,7 +424,7 @@ To keep it somewhere else, such as a SIEM, download it from the page: **JSON lin
 
 The rest of the design, in the order it's planned:
 
-- More than one sign-in provider (GitHub, which isn't OIDC, among them): [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, roles per person and per OIDC group, and the audit log and its export are in.
+- Sign-in providers beyond one OIDC provider and GitHub: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, GitHub sign-in, roles per person, per OIDC group and per GitHub team, and the audit log and its export are in.
 - apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file or a variable, a key check at start, and rotation; a KMS for the key (AWS KMS, Azure Key Vault, Google Cloud KMS) comes later, under [#920](https://github.com/conn3xorg/conn3x/issues/920).
