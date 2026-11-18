@@ -629,18 +629,18 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 		return err
 	}
 	r.saveFacts(ctx, id, p, c)
+	// Drift on the hosts that were checked stands, and goes on to be
+	// corrected. With none, the run fails before any outcome is stored, so
+	// it never shows as clean for hosts nothing looked at.
+	msg := unmatched.partial(limit)
+	if msg != "" && outcome != store.OutcomeDrift {
+		return errors.New(msg + ", so the run can't say they have no drift")
+	}
 	if err := r.Store.SetRunOutcome(context.Background(), id, outcome); err != nil {
 		return err
 	}
-	// Drift on the hosts that were checked stands, and goes on to be
-	// corrected; with none, the run fails, so it never reads as clean for
-	// hosts nothing looked at.
-	if msg := unmatched.partial(limit); msg != "" {
-		if outcome == store.OutcomeDrift {
-			r.note(id, upperFirst(msg)+"; the drift found on the others stands.")
-			return nil
-		}
-		return errors.New(msg + ", so the run can't say they have no drift")
+	if msg != "" {
+		r.note(id, upperFirst(msg)+"; the drift found on the others stands.")
 	}
 	return nil
 }
