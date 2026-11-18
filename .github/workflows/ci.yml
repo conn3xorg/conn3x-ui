@@ -25,4 +25,6 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       # shortcut: TestRealConn3x skips here (no CONN3X_BIN); point it at a
       # released conn3x once one carries the conn3x step object.
-      - run: go test -race ./...
+      # -timeout fails a hung test with every goroutine's stack, well before
+      # the runner's own limit cancels the job and its log is lost.
+      - run: go test -race -timeout 9m ./...
