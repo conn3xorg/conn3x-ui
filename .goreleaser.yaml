@@ -32,11 +32,55 @@ archives:
       - LICENSE
       - README.md
 
+nfpms:
+  - id: packages
+    ids: [conn3x-ui]
+    package_name: conn3x-ui
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: The Conn3x Authors
+    homepage: https://conn3x.org
+    maintainer: The Conn3x Authors <security@conn3x.org>
+    description: A web UI for Conn3x. Plan from the browser, apply exactly that plan.
+    license: MPL-2.0
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    mtime: "{{ .CommitDate }}"
+    # The binary only. How it runs, as which user and with which key, is
+    # the circuit's to set up (conn3xorg/circuit-conn3x-ui), or yours.
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/conn3x-ui/LICENSE
+        file_info: { mode: 0644, mtime: "{{ .CommitDate }}" }
+      - src: README.md
+        dst: /usr/share/doc/conn3x-ui/README.md
+        file_info: { mode: 0644, mtime: "{{ .CommitDate }}" }
+      - src: LICENSE
+        dst: /usr/share/doc/conn3x-ui/copyright
+        packager: deb
+        file_info: { mode: 0644, mtime: "{{ .CommitDate }}" }
+    # Signed with the same packages key as conn3x's, which its apt and dnf
+    # repositories check.
+    deb:
+      signature:
+        key_file: '{{ envOrDefault "PACKAGES_GPG_KEY_FILE" "" }}'
+    rpm:
+      signature:
+        key_file: '{{ envOrDefault "PACKAGES_GPG_KEY_FILE" "" }}'
+
 checksum:
   name_template: checksums.txt
 
 sboms:
   - artifacts: archive
+  # syft doesn't look inside a .deb or an .rpm; each package holds the
+  # binary from its architecture's archive, so that's what's scanned.
+  - id: packages
+    artifacts: package
+    args:
+      - "{{ .ProjectName }}_{{ .Version }}_linux_{{ .Arch }}.tar.gz"
+      - "--source-name=${artifact}"
+      - "--output=spdx-json=${document}"
+      - "--enrich=all"
 
 signs:
   - cmd: cosign
@@ -67,6 +111,33 @@ dockers_v2:
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.licenses: MPL-2.0
+
+homebrew_casks:
+  - name: conn3x-ui
+    repository:
+      owner: conn3xorg
+      name: homebrew-tap
+      # Token fields only expand .Env, not template functions.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://conn3x.org
+    description: A web UI for Conn3x. Plan from the browser, apply exactly that plan.
+    license: MPL-2.0
+    hooks:
+      post:
+        # The binary is not notarised by Apple; let Gatekeeper run it.
+        install_steps: |
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/conn3x-ui"]
+
+scoops:
+  - name: conn3x-ui
+    repository:
+      owner: conn3xorg
+      name: scoop-bucket
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://conn3x.org
+    description: A web UI for Conn3x. Plan from the browser, apply exactly that plan.
+    license: MPL-2.0
+    skip_upload: auto
 
 changelog:
   sort: asc

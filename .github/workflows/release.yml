@@ -16,6 +16,9 @@ jobs:
   release:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    # The tap token and the packages key live in this environment, which
+    # only main can deploy to, so no other branch's workflow can read them.
+    environment: release
     permissions:
       contents: write
       packages: write
@@ -32,6 +35,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # Fail before tagging, so a bad token or a missing key can't burn a
+      # version. An unreferenced blob changes nothing.
+      - name: Check the tap token and the packages key
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PACKAGES_GPG_KEY: ${{ secrets.PACKAGES_GPG_KEY }}
+        run: |
+          gh api repos/conn3xorg/homebrew-tap/git/blobs -f content=preflight --silent \
+            || { echo "HOMEBREW_TAP_TOKEN cannot write to conn3xorg/homebrew-tap" >&2; exit 1; }
+          gh api repos/conn3xorg/scoop-bucket/git/blobs -f content=preflight --silent \
+            || { echo "HOMEBREW_TAP_TOKEN cannot write to conn3xorg/scoop-bucket" >&2; exit 1; }
+          [ -n "$PACKAGES_GPG_KEY" ] || { echo "PACKAGES_GPG_KEY is empty" >&2; exit 1; }
       - name: Tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,6 +69,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Load the packages key
+        env:
+          PACKAGES_GPG_KEY: ${{ secrets.PACKAGES_GPG_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$PACKAGES_GPG_KEY" > "$RUNNER_TEMP/packages.asc"
+          echo "PACKAGES_GPG_KEY_FILE=$RUNNER_TEMP/packages.asc" >> "$GITHUB_ENV"
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           # An exact version, like every action here: the tool that builds
@@ -62,12 +84,15 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       - id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
             dist/checksums.txt
       # The attestation also lives in GitHub's attestation store; attaching
       # it to the release lets anyone verify offline, and lets OpenSSF
