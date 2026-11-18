@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -30,8 +31,8 @@ type fakeGitHub struct {
 
 type ghUser struct {
 	id     int64
-	member string // acme membership state, or "" for none
-	teams  map[string][]string
+	member string              // acme membership state, or "" for none
+	teams  map[string][]string // org: team IDs; the fake's slugs are team-ID
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -83,7 +84,8 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		out := []map[string]any{}
 		for org, slugs := range u.teams {
 			for _, s := range slugs {
-				out = append(out, map[string]any{"slug": s, "organization": map[string]string{"login": org}})
+				id, _ := strconv.ParseInt(s, 10, 64)
+				out = append(out, map[string]any{"id": id, "slug": "team-" + s, "organization": map[string]string{"login": org}})
 			}
 		}
 		json.NewEncoder(w).Encode(out)
@@ -155,9 +157,9 @@ func TestGitHubSignIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.srv.GitHub.AdminTeam = "platform"
-	e.srv.GitHub.TeamRoles = []GroupRole{{Group: "ops", Project: "web", Role: store.RolePlanner}}
-	e.gh.users["octo"] = ghUser{id: 42, member: "active", teams: map[string][]string{"acme": {"ops"}, "other": {"platform"}}}
+	e.srv.GitHub.AdminTeam = "1001"
+	e.srv.GitHub.TeamRoles = []GroupRole{{Group: "2002", Project: "web", Role: store.RolePlanner}}
+	e.gh.users["octo"] = ghUser{id: 42, member: "active", teams: map[string][]string{"acme": {"2002"}, "other": {"1001"}}}
 	e.gh.users["outsider"] = ghUser{id: 7}
 	e.gh.users["invited"] = ghUser{id: 8, member: "pending"}
 
@@ -203,6 +205,16 @@ func TestGitHubSignIn(t *testing.T) {
 	}
 	if n, _ := e.st.UserCount(ctx); n != 1 {
 		t.Errorf("a renamed login made a second user")
+	}
+
+	// A team made since, even under the admin team's old slug, has its own
+	// ID, so it grants nothing.
+	e.gh.users["squatter"] = ghUser{id: 99, member: "active", teams: map[string][]string{"acme": {"3003"}}}
+	if resp := e.fresh().signIn(t, "squatter", nil); resp.StatusCode != 303 {
+		t.Fatalf("squatter sign-in: %d", resp.StatusCode)
+	}
+	if u, err := e.st.OIDCUser(ctx, e.gh.URL, "99"); err != nil || u.Admin {
+		t.Errorf("a member of another team is an admin: %+v, %v", u, err)
 	}
 }
 

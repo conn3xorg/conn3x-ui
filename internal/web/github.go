@@ -24,7 +24,7 @@ import (
 // Enterprise Server, and lets in only active members of one organisation:
 // anyone can have a GitHub account. Its teams work as OIDC groups do:
 // AdminTeam's members are site admins, and TeamRoles give roles on
-// projects, checked at each sign-in.
+// projects, checked at each sign-in. Both name teams by numeric ID.
 type GitHub struct {
 	// URL is GitHub's web address, https://github.com or a GitHub
 	// Enterprise Server's. It's what users are linked to, as an OIDC
@@ -166,12 +166,15 @@ func (s *Server) githubUser(r *http.Request, g *GitHub, code, state, providerErr
 // at 100 a page.
 const maxTeamPages = 10
 
-// teams lists the slugs of the user's teams in g.Org.
+// teams lists the numeric IDs of the user's teams in g.Org. Roles match on
+// IDs, not slugs: any member can make a team by default, and a slug is
+// free again once its team is renamed or deleted, so a slug could be taken
+// by someone who wants the role it grants. An ID can't.
 func (g *GitHub) teams(ctx context.Context, token string) ([]string, error) {
 	var out []string
 	for page := 1; page <= maxTeamPages; page++ {
 		var batch []struct {
-			Slug         string `json:"slug"`
+			ID           int64 `json:"id"`
 			Organization struct {
 				Login string `json:"login"`
 			} `json:"organization"`
@@ -181,7 +184,7 @@ func (g *GitHub) teams(ctx context.Context, token string) ([]string, error) {
 		}
 		for _, t := range batch {
 			if strings.EqualFold(t.Organization.Login, g.Org) {
-				out = append(out, t.Slug)
+				out = append(out, strconv.FormatInt(t.ID, 10))
 			}
 		}
 		if len(batch) < 100 {

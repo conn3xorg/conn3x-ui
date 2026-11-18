@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,8 +73,8 @@ func main() {
 	fs.StringVar(&gc.redirectURL, "github-redirect-url", "", "this UI's callback, https://HOST/login/github/callback, as set on the OAuth app")
 	fs.StringVar(&gc.org, "github-org", "", "GitHub organisation whose active members may sign in")
 	fs.StringVar(&gc.url, "github-url", "https://github.com", "GitHub's address; a GitHub Enterprise Server's for one")
-	fs.StringVar(&gc.adminTeam, "github-admin-team", "", "team slug in -github-org whose members are site admins, checked at each sign-in")
-	fs.Var(&gc.roles, "github-role", "TEAM=PROJECT:ROLE gives a -github-org team's members that role on the project, checked at each sign-in; repeat it for more")
+	fs.StringVar(&gc.adminTeam, "github-admin-team", "", "numeric ID of the -github-org team whose members are site admins, checked at each sign-in")
+	fs.Var(&gc.roles, "github-role", "TEAM_ID=PROJECT:ROLE gives a -github-org team's members that role on the project, checked at each sign-in; the team by its numeric ID; repeat it for more")
 	publicURL := fs.String("public-url", "", "this UI's address, such as https://conn3x.example.com, for full links in webhooks")
 	retention := fs.Duration("fleet-retention", 90*24*time.Hour, "how long the fleet store keeps step results; the latest facts per host are kept for good")
 	var mc mailConfig
@@ -205,6 +206,15 @@ func setupGitHub(gc githubConfig) (*web.GitHub, error) {
 	}
 	if gc.redirectURL == "" {
 		return nil, errors.New("GitHub sign-in needs -github-redirect-url as well as -github-client-id")
+	}
+	teams := []string{gc.adminTeam}
+	for _, r := range gc.roles {
+		teams = append(teams, r.Group)
+	}
+	for _, t := range teams {
+		if _, err := strconv.ParseUint(t, 10, 63); t != "" && err != nil {
+			return nil, fmt.Errorf("GitHub teams are named by numeric ID, not slug, since any member can create a team with a free slug: %q. Find the ID with: gh api orgs/%s/teams/%s --jq .id", t, gc.org, t)
+		}
 	}
 	if gc.secretFile != "" {
 		b, err := os.ReadFile(gc.secretFile)

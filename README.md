@@ -386,15 +386,16 @@ If your people already live in a GitHub organisation, they can sign in with that
   -github-client-secret-file github-secret \
   -github-redirect-url https://conn3x.example.com/login/github/callback \
   -github-org acme \
-  -github-admin-team platform \
-  -github-role 'ops=web:approver' \
-  -github-role 'developers=web:planner'
+  -github-admin-team 4185301 \
+  -github-role '4185302=web:approver' \
+  -github-role '4185303=web:planner'
 ```
 
 The sign-in page gets a **Sign in with GitHub** button.
 
 - **`-github-org` is required.** Anyone can have a GitHub account, so only the organisation's active members get in. Someone invited but not yet accepted doesn't, and the audit log says why.
-- **Teams work like OIDC groups.** `-github-admin-team` and each `-github-role TEAM=PROJECT:ROLE` take team slugs in `-github-org`, are checked at every sign-in, and follow the same rules as `-oidc-admin-group` and `-oidc-role` above: the highest role wins, hand-set roles stay, and the last site admin stays one.
+- **Teams are named by numeric ID, not slug.** Any org member can create a team unless an owner turns that off, and a slug is free again once its team is renamed or deleted, so a slug could be claimed by someone who wants the role it grants. An ID can't. Find one with `gh api orgs/acme/teams/platform --jq .id`.
+- **Teams work like OIDC groups.** `-github-admin-team` and each `-github-role TEAM_ID=PROJECT:ROLE` name teams in `-github-org`, are checked at every sign-in, and follow the same rules as `-oidc-admin-group` and `-oidc-role` above: the highest role wins, hand-set roles stay, and the last site admin stays one.
 - **Users are tied to their GitHub ID,** not their login, so a renamed or reused login can't take over an account. A new user is named from their login.
 - **GitHub Enterprise Server:** add `-github-url https://github.example.com`. The API is then `/api/v3` there.
 - **What it reads.** The UI asks for the `read:org` scope, and reads the user, their membership in the organisation and their teams, once per sign-in. It keeps no token and logs none. The client secret comes from `-github-client-secret-file` or `CONN3X_UI_GITHUB_CLIENT_SECRET`, taken out of the environment once read.
