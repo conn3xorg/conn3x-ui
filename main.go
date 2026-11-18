@@ -49,7 +49,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-public-url URL] [-smtp-addr HOST:PORT -smtp-from ADDR ...] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
+		fmt.Fprintln(os.Stderr, "usage: conn3x-ui serve [-listen ADDR] [-data DIR] [-key-file FILE] [-public-url URL] [-smtp-addr HOST:PORT -smtp-from ADDR ...] [-oidc-issuer URL -oidc-client-id ID -oidc-redirect-url URL ...] [-github-client-id ID -github-org ORG -github-redirect-url URL ...]\n       conn3x-ui rotate-key [-data DIR] -old-key-file FILE -new-key-file FILE\n       conn3x-ui version")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -62,10 +62,18 @@ func main() {
 	fs.StringVar(&oc.secretFile, "oidc-client-secret-file", "", "file with the OIDC client secret; or set "+oidcSecretEnv)
 	fs.StringVar(&oc.redirectURL, "oidc-redirect-url", "", "this UI's callback, https://HOST/login/oidc/callback, as registered with the provider")
 	fs.StringVar(&oc.emailDomain, "oidc-email-domain", "", "only let in OIDC users with a verified email in this domain")
-	fs.BoolVar(&oc.noPassword, "no-password-sign-in", false, "turn off sign-in with a password, once a site admin signs in with OIDC")
+	fs.BoolVar(&oc.noPassword, "no-password-sign-in", false, "turn off sign-in with a password, once a site admin signs in with OIDC or GitHub")
 	fs.StringVar(&oc.groupsClaim, "oidc-groups-claim", "groups", "ID token claim that lists a user's groups")
 	fs.StringVar(&oc.adminGroup, "oidc-admin-group", "", "OIDC group whose members are site admins, checked at each sign-in")
 	fs.Var(&oc.roles, "oidc-role", "GROUP=PROJECT:ROLE gives the group's members that role on the project, checked at each sign-in; repeat it for more")
+	var gc githubConfig
+	fs.StringVar(&gc.clientID, "github-client-id", "", "GitHub OAuth app's client ID; turns on sign-in with GitHub, which needs -github-org")
+	fs.StringVar(&gc.secretFile, "github-client-secret-file", "", "file with the GitHub OAuth app's client secret; or set "+githubSecretEnv)
+	fs.StringVar(&gc.redirectURL, "github-redirect-url", "", "this UI's callback, https://HOST/login/github/callback, as set on the OAuth app")
+	fs.StringVar(&gc.org, "github-org", "", "GitHub organisation whose active members may sign in")
+	fs.StringVar(&gc.url, "github-url", "https://github.com", "GitHub's address; a GitHub Enterprise Server's for one")
+	fs.StringVar(&gc.adminTeam, "github-admin-team", "", "team slug in -github-org whose members are site admins, checked at each sign-in")
+	fs.Var(&gc.roles, "github-role", "TEAM=PROJECT:ROLE gives a -github-org team's members that role on the project, checked at each sign-in; repeat it for more")
 	publicURL := fs.String("public-url", "", "this UI's address, such as https://conn3x.example.com, for full links in webhooks")
 	retention := fs.Duration("fleet-retention", 90*24*time.Hour, "how long the fleet store keeps step results; the latest facts per host are kept for good")
 	var mc mailConfig
@@ -83,7 +91,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := serve(*listen, *data, *keyFile, *publicURL, oc, mailer, *retention, sandboxed); err != nil {
+	if err := serve(*listen, *data, *keyFile, *publicURL, oc, gc, mailer, *retention, sandboxed); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -174,6 +182,47 @@ func setupOIDC(ctx context.Context, oc oidcConfig) (*web.OIDC, error) {
 	return o, err
 }
 
+// githubConfig is the serve flags for sign-in with GitHub.
+type githubConfig struct {
+	clientID, secretFile, redirectURL, org, url, adminTeam string
+	roles                                                  roleFlags
+}
+
+// githubSecretEnv holds the GitHub client secret when
+// -github-client-secret-file doesn't.
+const githubSecretEnv = "CONN3X_UI_GITHUB_CLIENT_SECRET"
+
+// setupGitHub sets up sign-in with GitHub when -github-client-id is set,
+// and nil when it isn't. The secret is handled as setupOIDC's is.
+func setupGitHub(gc githubConfig) (*web.GitHub, error) {
+	secret := os.Getenv(githubSecretEnv)
+	os.Unsetenv(githubSecretEnv)
+	if gc.clientID == "" {
+		if gc.org != "" || gc.adminTeam != "" || len(gc.roles) > 0 {
+			return nil, errors.New("-github-org, -github-admin-team and -github-role need -github-client-id")
+		}
+		return nil, nil
+	}
+	if gc.redirectURL == "" {
+		return nil, errors.New("GitHub sign-in needs -github-redirect-url as well as -github-client-id")
+	}
+	if gc.secretFile != "" {
+		b, err := os.ReadFile(gc.secretFile)
+		if err != nil {
+			return nil, err
+		}
+		secret = string(b)
+	}
+	if strings.TrimSpace(secret) == "" {
+		return nil, errors.New("GitHub sign-in needs the OAuth app's client secret, from -github-client-secret-file or " + githubSecretEnv)
+	}
+	g, err := web.NewGitHub(gc.url, gc.clientID, strings.TrimSpace(secret), gc.redirectURL, gc.org)
+	if err == nil {
+		g.AdminTeam, g.TeamRoles = gc.adminTeam, gc.roles
+	}
+	return g, err
+}
+
 // rotateKey re-seals every credential in data's database under the new
 // key. Run it with the UI stopped: one still running has the old key.
 func rotateKey(data, oldFile, newFile string) error {
@@ -239,7 +288,7 @@ func (mc mailConfig) mailer() (*mail.Mailer, error) {
 	return &mail.Mailer{Addr: mc.addr, From: from[0], User: mc.user, Password: pw}, nil
 }
 
-func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.Mailer, retention time.Duration, sandboxed bool) error {
+func serve(listen, data, keyFile, publicURL string, oc oidcConfig, gc githubConfig, mailer *mail.Mailer, retention time.Duration, sandboxed bool) error {
 	if publicURL != "" {
 		if u, err := url.Parse(publicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("-public-url must be an http or https URL, such as https://conn3x.example.com")
@@ -292,8 +341,19 @@ func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.
 	if err != nil {
 		return err
 	}
+	g, err := setupGitHub(gc)
+	if err != nil {
+		return err
+	}
 	if oc.noPassword {
-		if err := web.TurnPasswordOff(ctx, st, o); err != nil {
+		var issuers []string
+		if o != nil {
+			issuers = append(issuers, o.Issuer)
+		}
+		if g != nil {
+			issuers = append(issuers, g.URL)
+		}
+		if err := web.TurnPasswordOff(ctx, st, issuers...); err != nil {
 			return err
 		}
 	}
@@ -312,7 +372,7 @@ func serve(listen, data, keyFile, publicURL string, oc oidcConfig, mailer *mail.
 	scheduled := make(chan struct{})
 	go func() { runner.Schedule(ctx); close(scheduled) }()
 	h := web.New(st, runner)
-	h.OIDC, h.PasswordOff = o, oc.noPassword
+	h.OIDC, h.GitHub, h.PasswordOff = o, g, oc.noPassword
 	srv := &http.Server{Addr: listen, Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()

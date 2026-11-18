@@ -73,21 +73,25 @@ func NewOIDC(ctx context.Context, issuer, clientID, clientSecret, redirectURL, e
 
 // seal signs values and an expiry into a cookie value. The values must
 // not hold a dot.
-func (o *OIDC) seal(values ...string) string {
+func (o *OIDC) seal(values ...string) string { return seal(o.key, values...) }
+
+// unseal checks a cookie value from seal and returns its n values, or nil
+// when it's forged or expired.
+func (o *OIDC) unseal(c string, n int) []string { return unseal(o.key, c, n) }
+
+func seal(key []byte, values ...string) string {
 	v := strings.Join(append(values, strconv.FormatInt(time.Now().Add(flowTTL).Unix(), 10)), ".")
-	m := hmac.New(sha256.New, o.key)
+	m := hmac.New(sha256.New, key)
 	m.Write([]byte(v))
 	return v + "." + hex.EncodeToString(m.Sum(nil))
 }
 
-// unseal checks a cookie value from seal and returns its n values, or nil
-// when it's forged or expired.
-func (o *OIDC) unseal(c string, n int) []string {
+func unseal(key []byte, c string, n int) []string {
 	i := strings.LastIndexByte(c, '.')
 	if i < 0 {
 		return nil
 	}
-	m := hmac.New(sha256.New, o.key)
+	m := hmac.New(sha256.New, key)
 	m.Write([]byte(c[:i]))
 	if !hmac.Equal([]byte(hex.EncodeToString(m.Sum(nil))), []byte(c[i+1:])) {
 		return nil
@@ -205,7 +209,7 @@ func (s *Server) oidcUser(r *http.Request, o *OIDC, code, state, providerErr str
 	// The subject alone says who it is: an email or name may be reused.
 	u, err := s.Store.OIDCUser(r.Context(), o.Issuer, idt.Subject)
 	if errors.Is(err, store.ErrNotFound) {
-		u, err = s.createOIDCUser(r, o, idt.Subject, c.PreferredUsername, c.Email)
+		u, err = s.createOIDCUser(r, o.Issuer, "OIDC", idt.Subject, c.PreferredUsername, c.Email)
 	}
 	if err != nil {
 		return store.User{}, err
@@ -213,19 +217,20 @@ func (s *Server) oidcUser(r *http.Request, o *OIDC, code, state, providerErr str
 	if u.Disabled {
 		return u, errors.New("disabled user")
 	}
-	return s.syncGroups(r, o, u, groups(all, cmp.Or(o.GroupsClaim, "groups")))
+	return s.syncGroups(r, o.AdminGroup, o.GroupRoles, "OIDC group", u, groups(all, cmp.Or(o.GroupsClaim, "groups")))
 }
 
 // GroupRole gives the members of an OIDC group a role on a project, by
 // the project's name.
 type GroupRole struct{ Group, Project, Role string }
 
-// ParseGroupRole reads GROUP=PROJECT:ROLE, as -oidc-role takes it.
+// ParseGroupRole reads GROUP=PROJECT:ROLE, as -oidc-role and -github-role
+// take it.
 func ParseGroupRole(s string) (GroupRole, error) {
 	g, rest, ok := strings.Cut(s, "=")
 	i := strings.LastIndex(rest, ":")
 	if !ok || g == "" || i <= 0 || !slices.Contains(store.Roles, rest[i+1:]) {
-		return GroupRole{}, fmt.Errorf("-oidc-role %q must be GROUP=PROJECT:ROLE, with a role one of %s", s, strings.Join(store.Roles, ", "))
+		return GroupRole{}, fmt.Errorf("%q must be GROUP=PROJECT:ROLE, with a role one of %s", s, strings.Join(store.Roles, ", "))
 	}
 	return GroupRole{Group: g, Project: rest[:i], Role: rest[i+1:]}, nil
 }
@@ -247,26 +252,28 @@ func groups(claims map[string]any, name string) []string {
 	return nil
 }
 
-// syncGroups sets u's site admin bit and group roles from their OIDC
-// groups, at each sign-in, and audits what changed. A role an admin set by
-// hand wins over a group's, and the last site admin is never demoted.
-func (s *Server) syncGroups(r *http.Request, o *OIDC, u store.User, have []string) (store.User, error) {
-	if o.AdminGroup == "" && len(o.GroupRoles) == 0 {
+// syncGroups sets u's site admin bit and group roles from the groups their
+// provider says they're in, OIDC groups or GitHub teams, at each sign-in,
+// and audits what changed. A role an admin set by hand wins over a
+// group's, and the last site admin is never demoted. kind names the groups
+// in the audit log.
+func (s *Server) syncGroups(r *http.Request, adminGroup string, groupRoles []GroupRole, kind string, u store.User, have []string) (store.User, error) {
+	if adminGroup == "" && len(groupRoles) == 0 {
 		return u, nil
 	}
 	ctx := r.Context()
 	in := func(g string) bool { return slices.Contains(have, g) }
-	if o.AdminGroup != "" && in(o.AdminGroup) != u.Admin {
-		switch err := s.Store.SetAdmin(ctx, u.ID, in(o.AdminGroup)); {
+	if adminGroup != "" && in(adminGroup) != u.Admin {
+		switch err := s.Store.SetAdmin(ctx, u.ID, in(adminGroup)); {
 		case errors.Is(err, store.ErrLastAdmin):
-			s.audit(ctx, u, store.Project{}, "user edit", u.Name+": stays a site admin, as the last one, though not in "+o.AdminGroup)
+			s.audit(ctx, u, store.Project{}, "user edit", u.Name+": stays a site admin, as the last one, though not in "+adminGroup)
 		case err != nil:
 			return u, err
 		default:
-			s.audit(ctx, u, store.Project{}, "user edit", fmt.Sprintf("%s: site admin %v, from OIDC group %s", u.Name, in(o.AdminGroup), o.AdminGroup))
+			s.audit(ctx, u, store.Project{}, "user edit", fmt.Sprintf("%s: site admin %v, from %s %s", u.Name, in(adminGroup), kind, adminGroup))
 		}
 	}
-	if len(o.GroupRoles) > 0 {
+	if len(groupRoles) > 0 {
 		ps, err := s.Store.Projects(ctx)
 		if err != nil {
 			return u, err
@@ -276,7 +283,7 @@ func (s *Server) syncGroups(r *http.Request, o *OIDC, u store.User, have []strin
 			byName[strings.ToLower(p.Name)] = p.ID
 		}
 		want := map[int64]string{}
-		for _, gr := range o.GroupRoles {
+		for _, gr := range groupRoles {
 			pid, ok := byName[strings.ToLower(gr.Project)]
 			if !ok || !in(gr.Group) {
 				continue
@@ -290,7 +297,7 @@ func (s *Server) syncGroups(r *http.Request, o *OIDC, u store.User, have []strin
 			return u, err
 		}
 		for _, c := range changes {
-			s.audit(ctx, u, store.Project{}, "role change", u.Name+", from OIDC groups: "+c)
+			s.audit(ctx, u, store.Project{}, "role change", u.Name+", from "+kind+"s: "+c)
 		}
 	}
 	return s.Store.User(ctx, u.ID)
@@ -298,21 +305,22 @@ func (s *Server) syncGroups(r *http.Request, o *OIDC, u store.User, have []strin
 
 var notNameChar = regexp.MustCompile(`[^A-Za-z0-9._@-]+`)
 
-// createOIDCUser makes the user for a subject's first sign-in, with no
-// roles and not a site admin. Their name is the preferred username or
-// email; when another user has it, a short hash of the subject goes on the
-// end, so nobody takes over an account by picking its name.
-func (s *Server) createOIDCUser(r *http.Request, o *OIDC, subject, username, email string) (store.User, error) {
+// createOIDCUser makes the user for a subject's first sign-in through a
+// provider, OIDC or GitHub, with no roles and not a site admin. Their name
+// is the preferred username or email; when another user has it, a short
+// hash of the subject goes on the end, so nobody takes over an account by
+// picking its name. via names the provider in the audit log.
+func (s *Server) createOIDCUser(r *http.Request, issuer, via, subject, username, email string) (store.User, error) {
 	name := cmp.Or(notNameChar.ReplaceAllString(cmp.Or(username, email), ""), "user")
 	name = name[:min(len(name), 50)]
-	sum := sha256.Sum256([]byte(o.Issuer + " " + subject))
+	sum := sha256.Sum256([]byte(issuer + " " + subject))
 	var id int64
 	var err error
 	for _, n := range []string{name, name + "-" + hex.EncodeToString(sum[:4])} {
 		if !userName.MatchString(n) {
 			continue
 		}
-		if id, err = s.Store.CreateOIDCUser(r.Context(), n, o.Issuer, subject); err == nil {
+		if id, err = s.Store.CreateOIDCUser(r.Context(), n, issuer, subject); err == nil {
 			break
 		}
 		if !strings.Contains(err.Error(), "UNIQUE constraint failed") {
@@ -324,26 +332,30 @@ func (s *Server) createOIDCUser(r *http.Request, o *OIDC, subject, username, ema
 	}
 	u, err := s.Store.User(r.Context(), id)
 	if err == nil {
-		s.audit(r.Context(), u, store.Project{}, "user create", u.Name+", from OIDC, "+o.Issuer)
+		s.audit(r.Context(), u, store.Project{}, "user create", u.Name+", from "+via+", "+issuer)
 	}
 	return u, err
 }
 
 // TurnPasswordOff readies the UI to start with password sign-in off. It
-// refuses unless OIDC is set up and a site admin who isn't disabled signs
-// in with it, since otherwise nobody could sign in to make one. Then it
-// ends every session of a user with no OIDC link: those were opened with
-// a password.
-func TurnPasswordOff(ctx context.Context, st *store.Store, o *OIDC) error {
-	if o == nil {
-		return errors.New("password sign-in can only be turned off with OIDC set up")
+// refuses unless single sign-on is set up, OIDC or GitHub, given by their
+// issuers, and a site admin who isn't disabled signs in with it, since
+// otherwise nobody could sign in to make one. Then it ends every session
+// of a user with no sign-on link: those were opened with a password.
+func TurnPasswordOff(ctx context.Context, st *store.Store, issuers ...string) error {
+	if len(issuers) == 0 {
+		return errors.New("password sign-in can only be turned off with OIDC or GitHub sign-in set up")
 	}
-	n, err := st.OIDCAdmins(ctx, o.Issuer)
-	if err == nil && n == 0 {
-		err = errors.New("password sign-in stays on until a site admin signs in with OIDC: sign in with OIDC once, make that user a site admin under Users, then restart with password sign-in off")
+	admins := 0
+	for _, iss := range issuers {
+		n, err := st.OIDCAdmins(ctx, iss)
+		if err != nil {
+			return err
+		}
+		admins += n
 	}
-	if err != nil {
-		return err
+	if admins == 0 {
+		return errors.New("password sign-in stays on until a site admin signs in with single sign-on: sign in that way once, make that user a site admin under Users, then restart with password sign-in off")
 	}
 	ended, err := st.EndPasswordSessions(ctx)
 	if err == nil && ended > 0 {

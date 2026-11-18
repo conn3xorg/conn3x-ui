@@ -46,6 +46,9 @@ type Server struct {
 	Log    *log.Logger
 	// OIDC, when set, offers sign-in with an OpenID Connect provider.
 	OIDC *OIDC
+	// GitHub, when set, offers sign-in with GitHub, for one
+	// organisation's members.
+	GitHub *GitHub
 	// PasswordOff turns off sign-in with a password, leaving OIDC.
 	PasswordOff bool
 	pages       map[string]*template.Template
@@ -85,6 +88,8 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /login", s.login)
 	s.mux.HandleFunc("GET /login/oidc", s.oidcStart)
 	s.mux.HandleFunc("GET /login/oidc/callback", s.oidcCallback)
+	s.mux.HandleFunc("GET /login/github", s.githubStart)
+	s.mux.HandleFunc("GET /login/github/callback", s.githubCallback)
 	s.mux.HandleFunc("POST /logout", s.logout)
 	s.mux.HandleFunc("GET /{$}", s.projects)
 	s.mux.HandleFunc("POST /projects", s.createProject)
@@ -138,7 +143,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/login" || strings.HasPrefix(r.URL.Path, "/login/oidc") {
+	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/login" || strings.HasPrefix(r.URL.Path, "/login/oidc") || strings.HasPrefix(r.URL.Path, "/login/github") {
 		if r.Method == http.MethodPost && !sameToken(r.PostFormValue("csrf"), cookie(r, "csrf")) {
 			http.Error(w, "the sign-in form expired; go back and try again", http.StatusForbidden)
 			return
@@ -304,7 +309,7 @@ func (s *Server) loginForm(w http.ResponseWriter, r *http.Request, status int, e
 func (s *Server) loginRender(w http.ResponseWriter, status int, csrf, errMsg string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	s.pages["login"].ExecuteTemplate(w, "layout", page{CSRF: csrf, Error: errMsg, Data: map[string]bool{"Password": !s.PasswordOff, "OIDC": s.OIDC != nil}})
+	s.pages["login"].ExecuteTemplate(w, "layout", page{CSRF: csrf, Error: errMsg, Data: map[string]bool{"Password": !s.PasswordOff, "OIDC": s.OIDC != nil, "GitHub": s.GitHub != nil}})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {

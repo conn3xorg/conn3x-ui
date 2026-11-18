@@ -290,10 +290,10 @@ func TestPasswordOff(t *testing.T) {
 
 	// Turning password sign-in off needs a site admin who signs in with
 	// OIDC, so nobody is locked out.
-	if TurnPasswordOff(ctx, e.st, nil) == nil {
+	if TurnPasswordOff(ctx, e.st) == nil {
 		t.Error("password sign-in off without OIDC")
 	}
-	if TurnPasswordOff(ctx, e.st, e.srv.OIDC) == nil {
+	if TurnPasswordOff(ctx, e.st, e.srv.OIDC.Issuer) == nil {
 		t.Error("password sign-in off with no OIDC admin")
 	}
 	olive := e.fresh()
@@ -301,7 +301,7 @@ func TestPasswordOff(t *testing.T) {
 	ou, _ := e.st.OIDCUser(ctx, e.idp.URL, "olive")
 	e.st.SetUser(ctx, ou.ID, true, false)
 	e.login(t)
-	if err := TurnPasswordOff(ctx, e.st, e.srv.OIDC); err != nil {
+	if err := TurnPasswordOff(ctx, e.st, e.srv.OIDC.Issuer); err != nil {
 		t.Fatalf("password sign-in off with an OIDC admin: %v", err)
 	}
 
