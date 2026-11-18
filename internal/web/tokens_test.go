@@ -108,6 +108,21 @@ func TestAPITokens(t *testing.T) {
 		t.Errorf("disabled user's token: %d, want 401", code)
 	}
 
+	// A password reset, as after a taken-over account, revokes the user's
+	// tokens along with their sessions.
+	if err := e.st.SetUser(ctx, uid, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if code := api(t, e.base, "GET", "/api/v1/hosts", patTok); code != http.StatusOK {
+		t.Fatalf("re-enabled user's token: %d", code)
+	}
+	if n, err := e.st.SetPassword(ctx, uid, "a brand new password 2", ""); err != nil || n != 1 {
+		t.Fatalf("reset revoked %d, %v", n, err)
+	}
+	if code := api(t, e.base, "GET", "/api/v1/hosts", patTok); code != http.StatusUnauthorized {
+		t.Errorf("token after a password reset: %d, want 401", code)
+	}
+
 	if resp := e.post("/account/tokens/"+strconv.FormatInt(toks[0].ID, 10)+"/delete", url.Values{"csrf": {csrf}}); resp.StatusCode != http.StatusSeeOther {
 		t.Errorf("revoke: %d", resp.StatusCode)
 	}

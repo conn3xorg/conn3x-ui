@@ -983,18 +983,26 @@ func (s *Store) SetUser(ctx context.Context, id int64, admin, disabled bool) err
 	return err
 }
 
-// SetPassword replaces a user's password and ends their sessions, all but
-// the one with token keep.
-func (s *Store) SetPassword(ctx context.Context, id int64, password, keep string) error {
+// SetPassword replaces a user's password, ends their sessions, all but
+// the one with token keep, and revokes their API tokens, since a new
+// password usually means the old ways in should stop. It returns how many
+// tokens it revoked.
+func (s *Store) SetPassword(ctx context.Context, id int64, password, keep string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash=? WHERE id=?", hashPassword(password, Token(16)), id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
-	_, err = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id=? AND token<>?", id, keep)
-	return err
+	if _, err = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id=? AND token<>?", id, keep); err != nil {
+		return 0, err
+	}
+	res, err = s.db.ExecContext(ctx, "DELETE FROM api_tokens WHERE user_id=?", id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // CheckPassword is ErrNotFound unless password is the user's.

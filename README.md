@@ -257,7 +257,7 @@ curl -H "$H" 'https://conn3x.example.com/api/v1/hosts/db3/changes?since=2026-11-
 curl -H "$H" 'https://conn3x.example.com/api/v1/steps?circuit=hardening&outcome=failed'
 ```
 
-A token reads `/api/` and nothing else, and only with GET. It has your roles, so when they change, so does what it sees. Disable a user and their tokens stop working with their sign-in. The UI keeps only each token's SHA-256 hash, and the Account page shows when each was last used. Tokens start `c3ui_`, so a secret scanner can spot one in a commit. Making and revoking one go in the audit log.
+A token reads `/api/` and nothing else, and only with GET. It has your roles, so when they change, so does what it sees. Disable a user and their tokens stop working with their sign-in. A new password, whether an admin resets it or the user changes it, revokes all their tokens too, so resetting a taken-over account closes every way in. For an OIDC user, a token keeps working after they're removed at the identity provider, until it expires or you disable them here: the UI only asks the provider at sign-in. The UI keeps only each token's SHA-256 hash, and the Account page shows when each was last used. Tokens start `c3ui_`, so a secret scanner can spot one in a commit. Making and revoking one go in the audit log.
 
 A `fact=name:value` matches a fact's value, or one key of a map, which is how `packages:openssl` finds a package. Results come newest first, at most 1,000 at a time, with `"truncated": true` when there are more. Step results are kept for 90 days, `-fleet-retention` to change it; the latest facts per host are kept for good.
 

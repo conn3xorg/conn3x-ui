@@ -137,11 +137,12 @@ func (s *Server) resetPassword(w http.ResponseWriter, r *http.Request) {
 		s.usersPage(w, r, http.StatusBadRequest, nil, err.Error())
 		return
 	}
-	if err := s.Store.SetPassword(r.Context(), u.ID, password, sess(r).token); err != nil {
+	revoked, err := s.Store.SetPassword(r.Context(), u.ID, password, sess(r).token)
+	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	s.audit(r.Context(), sess(r).user, store.Project{}, "password reset", u.Name)
+	s.audit(r.Context(), sess(r).user, store.Project{}, "password reset", u.Name+tokensRevoked(revoked, ", "))
 	if generated {
 		s.usersPage(w, r, http.StatusOK, map[string]string{"Name": u.Name, "Password": password}, "")
 		return
@@ -213,15 +214,17 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		err = errors.New("That isn't your current password.")
 	} else if err == nil && len(r.PostFormValue("password")) < minPassword {
 		err = fmt.Errorf("a password needs at least %d characters", minPassword)
-	} else if err == nil {
-		err = s.Store.SetPassword(r.Context(), u.ID, r.PostFormValue("password"), sess(r).token)
+	}
+	var revoked int64
+	if err == nil {
+		revoked, err = s.Store.SetPassword(r.Context(), u.ID, r.PostFormValue("password"), sess(r).token)
 	}
 	if err != nil {
 		s.accountPage(w, r, http.StatusBadRequest, accountData{}, err.Error())
 		return
 	}
-	s.audit(r.Context(), u, store.Project{}, "password change", "")
-	s.accountPage(w, r, http.StatusOK, accountData{Message: "Your password is changed. Your other sessions are signed out."}, "")
+	s.audit(r.Context(), u, store.Project{}, "password change", tokensRevoked(revoked, ""))
+	s.accountPage(w, r, http.StatusOK, accountData{Message: "Your password is changed. Your other sessions are signed out, and your API tokens are revoked."}, "")
 }
 
 // auditExport writes every audit entry that matches the page's filters,
@@ -327,4 +330,13 @@ func (s *Server) auditPage(w http.ResponseWriter, r *http.Request) {
 		d["Next"] = link(pg + 1)
 	}
 	s.render(w, r, "audit", http.StatusOK, d, "")
+}
+
+// tokensRevoked is an audit detail's note of how many API tokens a new
+// password revoked, after sep, or "" for none.
+func tokensRevoked(n int64, sep string) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s%d API tokens revoked", sep, n)
 }
