@@ -1,0 +1,20 @@
+{{define "title"}}{{.Data.Host}}{{end}}
+{{define "content"}}
+<h1>{{.Data.Host}} · <a href="/hosts">Hosts</a></h1>
+<h2>Facts</h2>
+{{range .Data.Facts}}
+<h3>{{.Project}} <small>read {{.At}}</small></h3>
+{{range $source, $json := .Sources}}<details><summary class="act">{{$source}}</summary><pre>{{$json}}</pre></details>{{end}}
+{{else}}<p>No facts yet.</p>{{end}}
+<h2>Steps</h2>
+{{if .Data.Results}}
+<table>
+  <tr><th>When</th><th>Project</th><th>Step</th><th>What</th><th>Outcome</th><th>Run</th></tr>
+  {{range .Data.Results}}
+  <tr><td>{{.At}}</td><td>{{.Project}}</td><td class="act">{{.Step}}{{with .Item}} [{{.}}]{{end}}</td><td>{{.Kind}} · {{.Action}}</td>
+    <td class="status {{.Outcome}}">{{.Outcome}}</td><td><a href="/runs/{{.RunID}}">{{.RunID}}</a></td></tr>
+  {{end}}
+</table>
+{{if .Data.Truncated}}<p><small>The latest 200. The API at <code>/api/v1/hosts/{{.Data.Host}}/changes</code> takes <code>since</code> for more.</small></p>{{end}}
+{{else}}<p>No steps applied or drifted here yet.</p>{{end}}
+{{end}}

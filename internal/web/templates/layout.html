@@ -30,7 +30,7 @@
 </head>
 <body>
 <header>
-  <span><a href="/">Conn3x</a>{{if .User.Name}} &nbsp; <a href="/runs">Runs</a>{{if .User.Admin}} &nbsp; <a href="/users">Users</a> &nbsp; <a href="/audit">Audit</a>{{end}}{{end}}</span>
+  <span><a href="/">Conn3x</a>{{if .User.Name}} &nbsp; <a href="/runs">Runs</a> &nbsp; <a href="/hosts">Hosts</a>{{if .User.Admin}} &nbsp; <a href="/users">Users</a> &nbsp; <a href="/audit">Audit</a>{{end}}{{end}}</span>
   {{if .User.Name}}<span><a href="/account"><small>{{.User.Name}}</small></a>
     <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Sign out</button></form></span>{{end}}
 </header>
