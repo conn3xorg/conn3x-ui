@@ -91,6 +91,12 @@ func TestMain(m *testing.M) {
 			os.WriteFile(".terraform/terraform.tfstate", []byte(`{"version":3,"backend":{"type":"http"}}`), 0o644)
 		}
 	case "plan":
+		// A -limit naming a host it doesn't have matches nothing, as conn3x
+		// warns, and a plan finds no changes.
+		if slices.ContainsFunc(os.Args, func(a string) bool { return strings.Contains(a, "ghost") }) {
+			fmt.Println(`{"@level":"warn","@message":"Warning: -limit matched no host","type":"diagnostic","diagnostic":{"severity":"warning","summary":"-limit matched no host","detail":""}}`)
+			return
+		}
 		if slices.Contains(os.Args, "-refresh-only") {
 			if strings.HasPrefix(mode, "drift") {
 				fmt.Println(strings.Replace(changeLine("web1", "build", "update"), "planned_change", "resource_drift", 1))

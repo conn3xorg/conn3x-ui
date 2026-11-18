@@ -315,4 +315,20 @@ func TestEventLimitAndVars(t *testing.T) {
 	if !strings.Contains(log.String(), "-limit==web1,=web2") {
 		t.Errorf("the run didn't plan with -limit:\n%s", log.String())
 	}
+
+	// An alert about a host the project doesn't have checks nothing, so the
+	// run fails rather than reading as clean.
+	ghost, ghostSecret, err := e.st.CreateEventRule(ctx, store.EventRule{ProjectID: pid, Name: "ghost", Alertname: "DiskFull", LimitLabel: "instance", Vars: "mount=mountpoint", Mode: store.ModeReport, DebounceMinutes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out = hookPost(t, e.base, ghost.ID, alerts([2]string{"ghost:9100", "/tmp"}), map[string]string{"Authorization": "Bearer " + hex.EncodeToString(ghostSecret)})
+	if code != http.StatusAccepted || out["result"] != "started" {
+		t.Fatalf("ghost: %d %v", code, out)
+	}
+	e.runner.Wait()
+	rn, err := e.st.Run(ctx, int64(out["run"].(float64)))
+	if err != nil || rn.Status == store.StatusSucceeded || !strings.Contains(rn.Error, "isn't in this project") {
+		t.Errorf("an alert for a host not in the project: %+v, %v", rn, err)
+	}
 }
