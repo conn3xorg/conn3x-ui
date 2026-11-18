@@ -218,7 +218,10 @@ func eventInput(e store.EventRule, alerts []map[string]string) (store.EventInput
 					h = h[:i]
 				}
 			}
-			if !hostName.MatchString(h) {
+			// shortcut: "all" is every host to -limit, and a group name is
+			// the group's hosts; refuse "all" here, and use conn3x's
+			// host-only term once it has one.
+			if !hostName.MatchString(h) || strings.EqualFold(h, "all") {
 				return in, fmt.Sprintf("label %s is %q, which isn't one host name", e.LimitLabel, a[e.LimitLabel])
 			}
 			if !seen[h] {

@@ -283,6 +283,7 @@ func TestEventLimitAndVars(t *testing.T) {
 	}
 	for name, body := range map[string]string{
 		"a glob":        alerts([2]string{"web*", "/var"}),
+		"all":           alerts([2]string{"all", "/var"}),
 		"a list":        alerts([2]string{"web1,web2", "/var"}),
 		"no host":       alerts([2]string{"", "/var"}),
 		"disagreement":  alerts([2]string{"web1:9100", "/var"}, [2]string{"web2:9100", "/srv"}),
