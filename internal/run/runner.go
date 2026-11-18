@@ -144,8 +144,8 @@ func (r *Runner) StartDrift(ctx context.Context, p store.Project, userID int64) 
 // body kept beside it, and returns the run's ID at once. It goes on to
 // correct or converge as the rule's mode says, under the same guards as a
 // schedule's.
-func (r *Runner) StartEvent(ctx context.Context, p store.Project, rule store.EventRule, body string) (int64, error) {
-	id, err := r.Store.CreateEventRun(ctx, rule, body)
+func (r *Runner) StartEvent(ctx context.Context, p store.Project, rule store.EventRule, body string, in store.EventInput) (int64, error) {
+	id, err := r.Store.CreateEventRun(ctx, rule, body, in)
 	if err != nil {
 		return 0, err
 	}
@@ -158,6 +158,20 @@ func (r *Runner) StartEvent(ctx context.Context, p store.Project, rule store.Eve
 		}
 	})
 	return id, nil
+}
+
+// eventInput adds what run id took from the event that started it to env,
+// and returns its -limit argument, if any.
+func (r *Runner) eventInput(id int64, env []string) ([]string, []string, error) {
+	in, err := r.Store.RunEventInput(context.Background(), id)
+	if err != nil {
+		return nil, env, err
+	}
+	var limit []string
+	if in.Limit != "" {
+		limit = []string{"-limit=" + in.Limit}
+	}
+	return limit, append(slices.Clip(env), in.Env...), nil
 }
 
 // ErrCancelled is why a run's context ended when somebody pressed Cancel.
@@ -473,6 +487,10 @@ func (r *Runner) checkout(ctx context.Context, id int64, p store.Project, sha st
 // doPlan plans and saves the plan file. after, when set, reads the plan in
 // the checkout, c.Dir, before it's removed.
 func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []string, after func(c *conn3xexec.Conn3x) error) error {
+	limit, env, err := r.eventInput(id, env)
+	if err != nil {
+		return err
+	}
 	work, _, tmp, err := r.checkout(ctx, id, p, "", env)
 	if err != nil {
 		return err
@@ -495,8 +513,9 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 	} else if t == "local" {
 		return ErrLocalState
 	}
-	r.note(id, "conn3x plan -input=false -out=plan.bin")
-	planErr := c.Run(ctx, r.record(id), "plan", "-input=false", "-out=plan.bin")
+	args := append([]string{"plan", "-input=false", "-out=plan.bin"}, limit...)
+	r.note(id, "conn3x "+strings.Join(args, " "))
+	planErr := c.Run(ctx, r.record(id), args[0], args[1:]...)
 	if planErr != nil {
 		return fmt.Errorf("plan: %w", planErr)
 	}
@@ -517,6 +536,10 @@ func (r *Runner) doPlan(ctx context.Context, id int64, p store.Project, env []st
 // doDrift refreshes the state against the hosts without planning any
 // change. -detailed-exitcode makes conn3x exit 2 when something drifted.
 func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []string) error {
+	limit, env, err := r.eventInput(id, env)
+	if err != nil {
+		return err
+	}
 	work, _, tmp, err := r.checkout(ctx, id, p, "", env)
 	if err != nil {
 		return err
@@ -535,9 +558,10 @@ func (r *Runner) doDrift(ctx context.Context, id int64, p store.Project, env []s
 	} else if t == "local" {
 		return ErrLocalState
 	}
-	r.note(id, "conn3x plan -refresh-only -detailed-exitcode -input=false -out=plan.bin")
+	args := append([]string{"plan", "-refresh-only", "-detailed-exitcode", "-input=false", "-out=plan.bin"}, limit...)
+	r.note(id, "conn3x "+strings.Join(args, " "))
 	outcome := store.OutcomeClean
-	err = c.Run(ctx, r.record(id), "plan", "-refresh-only", "-detailed-exitcode", "-input=false", "-out=plan.bin")
+	err = c.Run(ctx, r.record(id), args[0], args[1:]...)
 	var exit *conn3xexec.ExitError
 	if errors.As(err, &exit) && exit.Code == 2 {
 		outcome, err = store.OutcomeDrift, nil

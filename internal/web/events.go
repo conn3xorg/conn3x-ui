@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/conn3xorg/conn3x-ui/internal/store"
 )
@@ -29,6 +30,10 @@ var (
 	deliveryID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 	ruleName   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	labelName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	varName    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
+	// hostName is one host, with no glob or list, so an alert can't widen
+	// the run past the host it names.
+	hostName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$`)
 )
 
 // ruleForm reads an event rule from the form, or says what's wrong with it.
@@ -54,6 +59,23 @@ func ruleForm(r *http.Request, projectID int64) (store.EventRule, error) {
 		if !ok || !labelName.MatchString(strings.TrimSpace(k)) {
 			return e, fmt.Errorf("%q isn't LABEL=VALUE with a Prometheus label name", l)
 		}
+	}
+	e.LimitLabel = strings.TrimSpace(r.PostFormValue("limit_label"))
+	if e.LimitLabel != "" && !labelName.MatchString(e.LimitLabel) {
+		return e, fmt.Errorf("%q isn't a Prometheus label name", e.LimitLabel)
+	}
+	e.Vars = strings.TrimSpace(strings.ReplaceAll(r.PostFormValue("vars"), "\r\n", "\n"))
+	for _, l := range strings.Split(e.Vars, "\n") {
+		if l = strings.TrimSpace(l); l == "" {
+			continue
+		}
+		v, label, ok := strings.Cut(l, "=")
+		if !ok || !varName.MatchString(strings.TrimSpace(v)) || !labelName.MatchString(strings.TrimSpace(label)) {
+			return e, fmt.Errorf("%q isn't VARIABLE=LABEL", l)
+		}
+	}
+	if (e.LimitLabel != "" || e.Vars != "") && e.Alertname == "" && e.Labels == "" {
+		return e, errors.New("a rule that takes the host or variables from an alert needs an alertname or labels to match")
 	}
 	switch e.Mode {
 	case store.ModeReport, store.ModeCorrect, store.ModeConverge:
@@ -148,18 +170,20 @@ type alertmanager struct {
 	} `json:"alerts"`
 }
 
-// ruleMatches says whether an event is one the rule runs for: with no
-// alertname or labels, any; otherwise an Alertmanager payload with a firing
-// alert that has them all.
-func ruleMatches(e store.EventRule, body []byte) bool {
+// matchingAlerts returns the labels of each firing alert in an
+// Alertmanager payload that has the rule's alertname and labels, and says
+// whether the event is one the rule runs for: with no alertname or labels,
+// any event, with no alerts to read.
+func matchingAlerts(e store.EventRule, body []byte) ([]map[string]string, bool) {
 	pairs := e.LabelPairs()
 	if e.Alertname == "" && len(pairs) == 0 {
-		return true
+		return nil, true
 	}
 	var am alertmanager
 	if json.Unmarshal(body, &am) != nil {
-		return false
+		return nil, false
 	}
+	var out []map[string]string
 	for _, a := range am.Alerts {
 		if a.Status != "firing" || (e.Alertname != "" && a.Labels["alertname"] != e.Alertname) {
 			continue
@@ -172,10 +196,51 @@ func ruleMatches(e store.EventRule, body []byte) bool {
 			}
 		}
 		if all {
-			return true
+			out = append(out, a.Labels)
 		}
 	}
-	return false
+	return out, len(out) > 0
+}
+
+// eventInput is what a run takes from the alerts that matched: the hosts
+// in the rule's limit label, joined for -limit, and its variables. Each
+// limit value is one host name, a port after it dropped, and the alerts
+// must agree on each variable. It says why when they don't.
+func eventInput(e store.EventRule, alerts []map[string]string) (store.EventInput, string) {
+	var in store.EventInput
+	if e.LimitLabel != "" {
+		seen := map[string]bool{}
+		var hosts []string
+		for _, a := range alerts {
+			h := a[e.LimitLabel]
+			if i := strings.LastIndex(h, ":"); i > 0 {
+				if _, err := strconv.Atoi(h[i+1:]); err == nil {
+					h = h[:i]
+				}
+			}
+			if !hostName.MatchString(h) {
+				return in, fmt.Sprintf("label %s is %q, which isn't one host name", e.LimitLabel, a[e.LimitLabel])
+			}
+			if !seen[h] {
+				seen[h] = true
+				hosts = append(hosts, h)
+			}
+		}
+		in.Limit = strings.Join(hosts, ",")
+	}
+	for _, kv := range e.VarPairs() {
+		v := alerts[0][kv[1]]
+		for _, a := range alerts[1:] {
+			if a[kv[1]] != v {
+				return in, fmt.Sprintf("the alerts disagree on label %s, which sets %s", kv[1], kv[0])
+			}
+		}
+		if v == "" || len(v) > 1024 || strings.ContainsFunc(v, unicode.IsControl) {
+			return in, fmt.Sprintf("label %s, which sets %s, is empty, longer than 1024 characters or has a control character", kv[1], kv[0])
+		}
+		in.Env = append(in.Env, "TF_VAR_"+kv[0]+"="+v)
+	}
+	return in, ""
 }
 
 // hookReply writes a hook's JSON answer.
@@ -220,8 +285,14 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !ruleMatches(rule, body) {
+	alerts, matched := matchingAlerts(rule, body)
+	if !matched {
 		hookReply(w, http.StatusAccepted, map[string]any{"result": "no match"})
+		return
+	}
+	in, why := eventInput(rule, alerts)
+	if why != "" {
+		hookReply(w, http.StatusUnprocessableEntity, map[string]any{"error": why})
 		return
 	}
 	started, err := s.Store.ClaimEventRun(r.Context(), rule.ID)
@@ -238,11 +309,15 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	runID, err := s.Runner.StartEvent(r.Context(), p, rule, string(body))
+	runID, err := s.Runner.StartEvent(r.Context(), p, rule, string(body), in)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	s.audit(r.Context(), store.User{Name: "event rule " + rule.Name}, p, "event run", fmt.Sprintf("drift check %d, mode %s", runID, rule.Mode))
+	detail := fmt.Sprintf("drift check %d, mode %s", runID, rule.Mode)
+	if in.Limit != "" {
+		detail += ", limited to " + in.Limit
+	}
+	s.audit(r.Context(), store.User{Name: "event rule " + rule.Name}, p, "event run", detail)
 	hookReply(w, http.StatusAccepted, map[string]any{"result": "started", "run": runID})
 }

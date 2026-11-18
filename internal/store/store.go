@@ -218,6 +218,12 @@ var migrations = []string{
 		last_used_at TEXT NOT NULL DEFAULT '',
 		UNIQUE (user_id, name)
 	);`,
+	// 15: an event rule's alert label that names the host to run on and
+	// its variables taken from alert labels, and what a run got from them.
+	`ALTER TABLE event_rules ADD COLUMN limit_label TEXT NOT NULL DEFAULT '';
+	ALTER TABLE event_rules ADD COLUMN vars TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN event_limit TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN event_env TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is the database.

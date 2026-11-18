@@ -22,6 +22,12 @@ type EventRule struct {
 	// matches any signed request.
 	Alertname string
 	Labels    string
+	// LimitLabel is an alert label whose value is the host the run is
+	// limited to, as -limit; "" runs on every host.
+	LimitLabel string
+	// Vars is VAR=LABEL lines: each variable the run gets from an alert
+	// label, as TF_VAR_VAR.
+	Vars string
 	// Mode is what the run does about the drift it finds, as a schedule's
 	// ScheduleMode.
 	Mode string
@@ -33,9 +39,15 @@ type EventRule struct {
 }
 
 // LabelPairs is Labels as name and value pairs, blank lines dropped.
-func (e EventRule) LabelPairs() [][2]string {
+func (e EventRule) LabelPairs() [][2]string { return pairs(e.Labels) }
+
+// VarPairs is Vars as variable and label pairs, blank lines dropped.
+func (e EventRule) VarPairs() [][2]string { return pairs(e.Vars) }
+
+// pairs reads KEY=VALUE lines, blank lines dropped.
+func pairs(lines string) [][2]string {
 	var out [][2]string
-	for _, l := range strings.Split(e.Labels, "\n") {
+	for _, l := range strings.Split(lines, "\n") {
 		if k, v, ok := strings.Cut(strings.TrimSpace(l), "="); ok {
 			out = append(out, [2]string{strings.TrimSpace(k), strings.TrimSpace(v)})
 		}
@@ -43,11 +55,11 @@ func (e EventRule) LabelPairs() [][2]string {
 	return out
 }
 
-const ruleCols = "id, project_id, name, alertname, labels, mode, debounce_minutes, last_started_at, created_at"
+const ruleCols = "id, project_id, name, alertname, labels, limit_label, vars, mode, debounce_minutes, last_started_at, created_at"
 
 func scanRule(row interface{ Scan(...any) error }) (EventRule, error) {
 	var e EventRule
-	err := row.Scan(&e.ID, &e.ProjectID, &e.Name, &e.Alertname, &e.Labels, &e.Mode, &e.DebounceMinutes, &e.LastStartedAt, &e.CreatedAt)
+	err := row.Scan(&e.ID, &e.ProjectID, &e.Name, &e.Alertname, &e.Labels, &e.LimitLabel, &e.Vars, &e.Mode, &e.DebounceMinutes, &e.LastStartedAt, &e.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -73,8 +85,8 @@ func (s *Store) CreateEventRule(ctx context.Context, e EventRule) (EventRule, []
 	rand.Read(nonce)
 	sealed := s.aead.Seal(nonce, nonce, secret, ruleAD(e.ProjectID, e.Name))
 	e.CreatedAt = now()
-	res, err := s.db.ExecContext(ctx, "INSERT INTO event_rules (project_id, name, secret, alertname, labels, mode, debounce_minutes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		e.ProjectID, e.Name, sealed, e.Alertname, e.Labels, e.Mode, e.DebounceMinutes, e.CreatedAt)
+	res, err := s.db.ExecContext(ctx, "INSERT INTO event_rules (project_id, name, secret, alertname, labels, limit_label, vars, mode, debounce_minutes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		e.ProjectID, e.Name, sealed, e.Alertname, e.Labels, e.LimitLabel, e.Vars, e.Mode, e.DebounceMinutes, e.CreatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return e, nil, fmt.Errorf("this project already has an event rule called %s", e.Name)
@@ -166,22 +178,45 @@ func (s *Store) ClaimEventRun(ctx context.Context, ruleID int64) (bool, error) {
 	return n == 1, nil
 }
 
+// EventInput is what a run takes from the event that started it: the
+// host it's limited to, as -limit, and TF_VAR_ variables.
+type EventInput struct {
+	Limit string
+	Env   []string
+}
+
 // CreateEventRun adds a queued drift check that rule started, keeping the
-// event's body with it, and returns its ID.
-func (s *Store) CreateEventRun(ctx context.Context, rule EventRule, body string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_at, event_rule_id, event_rule_name, event_body) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		rule.ProjectID, KindDrift, StatusQueued, now(), rule.ID, rule.Name, body)
+// event's body and what the run takes from it, and returns its ID.
+func (s *Store) CreateEventRun(ctx context.Context, rule EventRule, body string, in EventInput) (int64, error) {
+	res, err := s.db.ExecContext(ctx, "INSERT INTO runs (project_id, kind, status, created_at, event_rule_id, event_rule_name, event_body, event_limit, event_env) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		rule.ProjectID, KindDrift, StatusQueued, now(), rule.ID, rule.Name, body, in.Limit, strings.Join(in.Env, "\n"))
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
 }
 
-// InheritEvent gives run id the event rule of run from, so the plan and
-// apply that follow an event's drift check say what started them.
+// InheritEvent gives run id the event rule of run from, and what it took
+// from the event, so the plan and apply that follow an event's drift check
+// say what started them and plan the same hosts with the same variables.
 func (s *Store) InheritEvent(ctx context.Context, id, from int64) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE runs SET (event_rule_id, event_rule_name) = (SELECT event_rule_id, event_rule_name FROM runs WHERE id=?) WHERE id=?", from, id)
+	_, err := s.db.ExecContext(ctx, "UPDATE runs SET (event_rule_id, event_rule_name, event_limit, event_env) = (SELECT event_rule_id, event_rule_name, event_limit, event_env FROM runs WHERE id=?) WHERE id=?", from, id)
 	return err
+}
+
+// RunEventInput is what a run took from the event that started it, empty
+// for a run no event started.
+func (s *Store) RunEventInput(ctx context.Context, runID int64) (EventInput, error) {
+	var in EventInput
+	var env string
+	err := s.db.QueryRowContext(ctx, "SELECT event_limit, event_env FROM runs WHERE id=?", runID).Scan(&in.Limit, &env)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrNotFound
+	}
+	if env != "" {
+		in.Env = strings.Split(env, "\n")
+	}
+	return in, err
 }
 
 // EventBody is the event that started a run, or "" for a run no event

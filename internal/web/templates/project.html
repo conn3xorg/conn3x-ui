@@ -70,10 +70,11 @@
   {{end}}
   {{if .Data.EventRules}}
   <table>
-    <tr><th>Name</th><th>Matches</th><th>Does</th><th>Debounce</th><th>Last run</th><th></th></tr>
+    <tr><th>Name</th><th>Matches</th><th>Takes</th><th>Does</th><th>Debounce</th><th>Last run</th><th></th></tr>
     {{range .Data.EventRules}}
     <tr><td class="act">{{.Name}}</td>
       <td>{{if or .Alertname .Labels}}{{with .Alertname}}alertname={{.}} {{end}}{{range .LabelPairs}}{{index . 0}}={{index . 1}} {{end}}{{else}}any signed request{{end}}</td>
+      <td>{{with .LimitLabel}}hosts from {{.}} {{end}}{{range .VarPairs}}{{index . 0}} from {{index . 1}} {{end}}{{if not (or .LimitLabel .Vars)}}nothing{{end}}</td>
       <td>{{.Mode}}</td><td>{{.DebounceMinutes}} min</td><td>{{or .LastStartedAt "never"}}</td>
       <td>{{if $.Data.SiteAdmin}}<form method="post" action="/projects/{{$.Data.Project.ID}}/events/{{.ID}}/delete" onsubmit="return confirm('Delete the event rule {{.Name}}?')">
         <input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="danger">Delete</button></form>{{end}}</td></tr>
@@ -90,6 +91,12 @@
     <label for="rule_labels">Labels</label>
     <textarea id="rule_labels" name="labels" placeholder="severity=critical" spellcheck="false"></textarea>
     <small>Leave both empty to run for any request signed with the rule's secret. Otherwise an Alertmanager alert has to be firing with that alertname and every LABEL=VALUE.</small>
+    <label for="rule_limit">Host from label</label>
+    <input id="rule_limit" name="limit_label" placeholder="instance">
+    <small>Run only on the host this alert label names, as <code>-limit</code>. A port after it is dropped, and a value that isn't one host name is refused, so an alert can't widen the run.</small>
+    <label for="rule_vars">Variables from labels</label>
+    <textarea id="rule_vars" name="vars" placeholder="mount=mountpoint" spellcheck="false"></textarea>
+    <small>VARIABLE=LABEL lines. Each reaches the run as <code>TF_VAR_VARIABLE</code>, checked against the variable's type and validation like any input. Both need an alertname or labels to match.</small>
     <label for="rule_mode">Does about drift</label>
     <select id="rule_mode" name="mode"><option value="report">reports it</option><option value="correct">corrects it</option><option value="converge">converges</option></select>
     <small>Correcting and converging have the schedule's guards: nothing is deleted or replaced unattended, and the project's most changes applies.</small>

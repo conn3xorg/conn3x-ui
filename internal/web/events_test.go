@@ -177,6 +177,9 @@ func TestEventRuleForm(t *testing.T) {
 		{"name": {"x"}, "mode": {"apply-everything"}, "debounce": {"10"}},
 		{"name": {"x"}, "mode": {"report"}, "debounce": {"0"}},
 		{"name": {"disk-full"}, "mode": {"report"}, "debounce": {"10"}},
+		{"name": {"y"}, "limit_label": {"instance"}, "mode": {"report"}, "debounce": {"10"}},
+		{"name": {"y"}, "alertname": {"A"}, "limit_label": {"not-a-label"}, "mode": {"report"}, "debounce": {"10"}},
+		{"name": {"y"}, "alertname": {"A"}, "vars": {"mount"}, "mode": {"report"}, "debounce": {"10"}},
 	} {
 		bad.Set("csrf", csrf)
 		if resp := e.post(path+"/events", bad); resp.StatusCode != http.StatusBadRequest {
@@ -248,5 +251,67 @@ func TestEventRuleCorrects(t *testing.T) {
 		if err != nil || rn.EventRule != "fixer" || rn.Status != store.StatusSucceeded {
 			t.Errorf("%s: %+v, %v", kind, rn, err)
 		}
+	}
+}
+
+// A rule can limit its run to the host an alert names and pass variables
+// from its labels. A value that isn't one host name, or alerts that
+// disagree on a variable, start nothing.
+func TestEventLimitAndVars(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	if err := e.st.SetKey(bytes.Repeat([]byte{7}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	exe, _ := os.Executable()
+	repo, _ := gitServer(t, map[string]string{"main.tf": "# circuits\n"})
+	pid, err := e.st.CreateProject(ctx, store.Project{Name: "web", GitURL: repo, GitRef: "main", Path: ".", Conn3xPath: exe, Env: "CONN3X_FAKE=drift"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, secret, err := e.st.CreateEventRule(ctx, store.EventRule{ProjectID: pid, Name: "disk", Alertname: "DiskFull", LimitLabel: "instance", Vars: "mount=mountpoint", Mode: store.ModeReport, DebounceMinutes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bearer := map[string]string{"Authorization": "Bearer " + hex.EncodeToString(secret)}
+	alerts := func(as ...[2]string) string {
+		var parts []string
+		for _, a := range as {
+			parts = append(parts, fmt.Sprintf(`{"status":"firing","labels":{"alertname":"DiskFull","instance":%q,"mountpoint":%q}}`, a[0], a[1]))
+		}
+		return `{"alerts":[` + strings.Join(parts, ",") + `]}`
+	}
+	for name, body := range map[string]string{
+		"a glob":        alerts([2]string{"web*", "/var"}),
+		"a list":        alerts([2]string{"web1,web2", "/var"}),
+		"no host":       alerts([2]string{"", "/var"}),
+		"disagreement":  alerts([2]string{"web1:9100", "/var"}, [2]string{"web2:9100", "/srv"}),
+		"no mountpoint": alerts([2]string{"web1:9100", ""}),
+	} {
+		if code, out := hookPost(t, e.base, rule.ID, body, bearer); code != http.StatusUnprocessableEntity {
+			t.Errorf("%s: %d %v, want 422", name, code, out)
+		}
+	}
+	code, out := hookPost(t, e.base, rule.ID, alerts([2]string{"web1:9100", "/var"}, [2]string{"web2:9100", "/var"}, [2]string{"web1:9100", "/var"}), bearer)
+	if code != http.StatusAccepted || out["result"] != "started" {
+		t.Fatalf("%d %v", code, out)
+	}
+	e.runner.Wait()
+	runID := int64(out["run"].(float64))
+	in, err := e.st.RunEventInput(ctx, runID)
+	if err != nil || in.Limit != "web1,web2" || fmt.Sprint(in.Env) != "[TF_VAR_mount=/var]" {
+		t.Errorf("input %+v, %v", in, err)
+	}
+	lines, _, err := e.st.Events(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	for _, l := range lines {
+		log.Write(l)
+		log.WriteByte('\n')
+	}
+	if !strings.Contains(log.String(), "-limit=web1,web2") {
+		t.Errorf("the run didn't plan with -limit:\n%s", log.String())
 	}
 }
