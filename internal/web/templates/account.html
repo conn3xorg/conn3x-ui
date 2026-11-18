@@ -1,7 +1,7 @@
 {{define "title"}}Account{{end}}
 {{define "content"}}
 <h1>{{.User.Name}}</h1>
-{{with .Data}}<p class="shown">{{.}}</p>{{end}}
+{{with .Data.Message}}<p class="shown">{{.}}</p>{{end}}
 {{if .User.OIDC}}<p>You sign in with single sign-on, so there's no password to change here.</p>
 {{else}}
 <h2>Change your password</h2>
@@ -15,4 +15,25 @@
   <p><button class="primary">Change password</button></p>
 </form>
 {{end}}
+<h2>API tokens</h2>
+<p>A token lets a script read <code>/api/v1/</code> as you, with your roles, by sending <code>Authorization: Bearer</code> and the token. It can only read.</p>
+{{with .Data.NewToken}}<p class="shown">Your new token is <code>{{.}}</code>. Copy it now: it isn't shown again.</p>{{end}}
+{{if .Data.Tokens}}
+<table>
+  <tr><th>Name</th><th>Made</th><th>Expires</th><th>Last used</th><th></th></tr>
+  {{range .Data.Tokens}}
+  <tr><td class="act">{{.Name}}</td><td>{{.CreatedAt}}</td><td>{{.ExpiresAt}}</td><td>{{or .LastUsedAt "never"}}</td>
+    <td><form method="post" action="/account/tokens/{{.ID}}/delete" onsubmit="return confirm('Revoke the token {{.Name}}?')">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}"><button class="danger">Revoke</button></form></td></tr>
+  {{end}}
+</table>
+{{end}}
+<form method="post" action="/account/tokens" style="max-width: 24rem">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label for="token_name">Name</label>
+  <input id="token_name" name="name" placeholder="inventory script" maxlength="64" required>
+  <label for="token_days">Lasts, in days</label>
+  <input id="token_days" name="days" type="number" min="1" max="365" value="90" required>
+  <p><button class="primary">Make a token</button></p>
+</form>
 {{end}}

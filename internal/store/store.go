@@ -207,6 +207,17 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN event_rule_id INTEGER REFERENCES event_rules(id) ON DELETE SET NULL;
 	ALTER TABLE runs ADD COLUMN event_rule_name TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN event_body TEXT NOT NULL DEFAULT '';`,
+	// 14: API tokens, each a user's, kept as a SHA-256 hash.
+	`CREATE TABLE api_tokens (
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name TEXT NOT NULL,
+		hash TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		last_used_at TEXT NOT NULL DEFAULT '',
+		UNIQUE (user_id, name)
+	);`,
 }
 
 // Store is the database.

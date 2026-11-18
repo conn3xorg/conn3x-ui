@@ -150,7 +150,58 @@ func (s *Server) resetPassword(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) account(w http.ResponseWriter, r *http.Request) {
-	s.render(w, r, "account", http.StatusOK, nil, "")
+	s.accountPage(w, r, http.StatusOK, accountData{}, "")
+}
+
+// accountData is the account page: a message, and a token just made,
+// shown once.
+type accountData struct {
+	Message  string
+	NewToken string
+	Tokens   []store.APIToken
+}
+
+func (s *Server) accountPage(w http.ResponseWriter, r *http.Request, status int, d accountData, errMsg string) {
+	var err error
+	if d.Tokens, err = s.Store.APITokens(r.Context(), sess(r).user.ID); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "account", status, d, errMsg)
+}
+
+// createToken makes an API token for the signed-in user. It reads the API
+// as they would, with their roles.
+func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	days, err := strconv.Atoi(r.PostFormValue("days"))
+	var tok string
+	switch {
+	case name == "" || len(name) > 64:
+		err = errors.New("a token's name is 1 to 64 characters")
+	case err != nil || days < 1 || days > 365:
+		err = errors.New("a token lasts 1 to 365 days")
+	default:
+		tok, err = s.Store.CreateAPIToken(r.Context(), sess(r).user.ID, name, days)
+	}
+	if err != nil {
+		s.accountPage(w, r, http.StatusBadRequest, accountData{}, err.Error())
+		return
+	}
+	s.audit(r.Context(), sess(r).user, store.Project{}, "api token create", fmt.Sprintf("%s, %d days", name, days))
+	s.accountPage(w, r, http.StatusOK, accountData{NewToken: tok}, "")
+}
+
+// deleteToken revokes one of the signed-in user's tokens.
+func (s *Server) deleteToken(w http.ResponseWriter, r *http.Request) {
+	tid, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	name, err := s.Store.DeleteAPIToken(r.Context(), sess(r).user.ID, tid)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r.Context(), sess(r).user, store.Project{}, "api token revoke", name)
+	http.Redirect(w, r, "/account", http.StatusSeeOther)
 }
 
 // changePassword sets the user's own password, given the one they have,
@@ -166,11 +217,11 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		err = s.Store.SetPassword(r.Context(), u.ID, r.PostFormValue("password"), sess(r).token)
 	}
 	if err != nil {
-		s.render(w, r, "account", http.StatusBadRequest, nil, err.Error())
+		s.accountPage(w, r, http.StatusBadRequest, accountData{}, err.Error())
 		return
 	}
 	s.audit(r.Context(), u, store.Project{}, "password change", "")
-	s.render(w, r, "account", http.StatusOK, "Your password is changed. Your other sessions are signed out.", "")
+	s.accountPage(w, r, http.StatusOK, accountData{Message: "Your password is changed. Your other sessions are signed out."}, "")
 }
 
 // auditExport writes every audit entry that matches the page's filters,

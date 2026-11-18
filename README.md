@@ -245,16 +245,19 @@ Not yet: taking variables or the hosts to run on from the event, and keeping par
 - **Step results.** Every step an apply ran on every host, with its outcome and how long it took, and every step a drift check or plan found drifted.
 - **Facts.** The latest of what each project's `conn3x_host`, `conn3x_packages` and `conn3x_services` data sources read about each host, from every plan and drift check. How a fact was read, such as the `ssh` block, isn't kept, and neither is anything the plan marks sensitive.
 
-Ask it over a read-only JSON API, signed in as yourself; you see only the projects you can view:
+Ask it over a read-only JSON API, as yourself; you see only the projects you can view. For a script, make an **API token** on your **Account** page: name it, give it 1 to 365 days, and copy it, since it's shown once. Send it as a bearer token:
 
 ```sh
+H="Authorization: Bearer $CONN3X_UI_TOKEN"
 # Hosts that run Rocky Linux and have openssl installed
-curl -b session=... 'https://conn3x.example.com/api/v1/hosts?fact=os_id:rocky&fact=packages:openssl'
+curl -H "$H" 'https://conn3x.example.com/api/v1/hosts?fact=os_id:rocky&fact=packages:openssl'
 # What was applied to db3, or drifted there, since Tuesday
-curl -b session=... 'https://conn3x.example.com/api/v1/hosts/db3/changes?since=2026-11-10'
+curl -H "$H" 'https://conn3x.example.com/api/v1/hosts/db3/changes?since=2026-11-10'
 # Steps of the hardening circuit that failed
-curl -b session=... 'https://conn3x.example.com/api/v1/steps?circuit=hardening&outcome=failed'
+curl -H "$H" 'https://conn3x.example.com/api/v1/steps?circuit=hardening&outcome=failed'
 ```
+
+A token reads `/api/` and nothing else, and only with GET. It has your roles, so when they change, so does what it sees. Disable a user and their tokens stop working with their sign-in. The UI keeps only each token's SHA-256 hash, and the Account page shows when each was last used. Tokens start `c3ui_`, so a secret scanner can spot one in a commit. Making and revoking one go in the audit log.
 
 A `fact=name:value` matches a fact's value, or one key of a map, which is how `packages:openssl` finds a package. Results come newest first, at most 1,000 at a time, with `"truncated": true` when there are more. Step results are kept for 90 days, `-fleet-retention` to change it; the latest facts per host are kept for good.
 
