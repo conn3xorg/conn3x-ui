@@ -198,6 +198,46 @@ CONN3X_UI_SMTP_PASSWORD=... ./conn3x-ui serve -smtp-addr smtp.example.com:587 -s
 
 The UI only sends mail over STARTTLS, except to a server on loopback, such as a local relay. `-smtp-password-file` takes the password from a file instead, and the UI takes the variable out of its environment once it's read. A mail that can't be sent is logged, and the run stands as it ended.
 
+## Runs started by events
+
+A disk fills up at 3am. Alertmanager knows; the UI doesn't. An **event rule** closes that gap: when an alert or a signed webhook arrives, it starts a drift check of its project, and the check can report, correct or converge as a schedule's does, under the same guards.
+
+A site admin adds rules under **Event rules** on the project page. A rule has:
+
+- a **name**,
+- an **alertname** and **labels**, `LABEL=VALUE` lines, that a firing Alertmanager alert must all have. Leave both empty and any request signed with the rule's secret starts a run,
+- what the run does about drift: **reports it**, **corrects it** or **converges**,
+- a **debounce**, 1 to 1440 minutes. After the rule starts a run, events in that time are folded into it, so a flood of alerts is one run.
+
+Saving a rule shows its URL, `/hooks/<id>`, and a secret, once. The secret is sealed with the credentials key like a credential, so rules need the key too, and `rotate-key` re-seals them.
+
+Point Alertmanager at the URL with the secret as a bearer token:
+
+```yaml
+receivers:
+  - name: conn3x
+    webhook_configs:
+      - url: https://conn3x.example.com/hooks/3
+        http_config:
+          authorization:
+            credentials_file: /etc/alertmanager/conn3x-hook-3
+```
+
+Anything else signs each request. Send `X-Conn3x-Timestamp`, the time in Unix seconds, a unique `X-Conn3x-Delivery`, and `X-Conn3x-Signature: sha256=` followed by the hex HMAC-SHA256 of the timestamp, a dot and the body, keyed with the secret:
+
+```sh
+ts=$(date +%s); body='{"reason":"deploy finished"}'
+sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex | cut -d' ' -f2)
+curl -X POST https://conn3x.example.com/hooks/3 -H "X-Conn3x-Timestamp: $ts" \
+  -H "X-Conn3x-Delivery: $(uuidgen)" -H "X-Conn3x-Signature: sha256=$sig" -d "$body"
+```
+
+A timestamp more than five minutes off, a delivery ID the rule has seen, a wrong secret and a rule that doesn't exist are all refused, the last two alike. The answer is JSON: `"started"` with the run's ID, `"folded"` inside the debounce, or `"no match"`. Bodies are capped at 1 MiB.
+
+The run shows in **Runs** as started by its rule, with the event that started it on its run page, and so do the plan and apply that follow when the rule corrects or converges. The audit log records each rule added and deleted, and each run a rule started.
+
+Not yet: taking variables or the hosts to run on from the event, and keeping parts of an event out of the run page.
+
 ## The fleet store
 
 "Which hosts run Rocky Linux 10?" and "what changed on db3 last Tuesday?" shouldn't mean reading run logs. The UI keeps the answers as runs finish:
@@ -235,6 +275,7 @@ Without the sandbox (`-sandbox=off`, macOS, or an older kernel), a run executes 
 Either way:
 
 - **Only a site admin can change what a run executes:** a project's Git URL, its Conn3x binary and its environment variables. A project admin can't, and the form shows them read-only.
+- **Only a site admin can add or delete an event rule.** A rule lets whoever holds its secret start runs of its project, and correct or converge with nobody approving. `/hooks/` is the one path that takes no session, so put the UI behind TLS before you give a rule's URL to anything.
 - **No credential can be named for a variable that changes how a run's programs start**, such as `PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND` or anything starting `TF_` or `CONN3X_`. They're refused when a credential is saved and again when a run starts.
 - **A run can still read what the system lets anyone read**, such as `/etc`, and use the network as this server can. Keep cloud metadata endpoints and internal services behind their own auth, as for any CI runner.
 

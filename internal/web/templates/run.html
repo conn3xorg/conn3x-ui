@@ -2,6 +2,7 @@
 {{define "content"}}
 <h1>{{if eq .Data.Run.Kind "apply"}}Apply{{else if eq .Data.Run.Kind "drift"}}Drift check{{else}}Plan{{end}} {{.Data.Run.ID}} · <a href="/projects/{{.Data.Project.ID}}">{{.Data.Project.Name}}</a></h1>
 {{template "status" .}}
+{{with .Data.Event}}<details><summary>The event that started it</summary><pre>{{.}}</pre></details>{{end}}
 <h2>Output</h2>
 <pre id="log">{{range .Data.Lines}}{{lineText .}}
 {{end}}</pre>
@@ -19,13 +20,13 @@
 <div id="status" {{if not .Data.Run.Finished}}hx-get="/runs/{{.Data.Run.ID}}/status" hx-trigger="every 2s, refresh" hx-swap="outerHTML"{{end}}>
   <p>
     <span class="status {{.Data.Run.Status}}">{{.Data.Run.Status}}</span>{{with .Data.Run.Outcome}} · <span class="status {{.}}">{{.}}</span>{{end}}
-    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else if .Data.Run.BySchedule}}the schedule{{else}}a removed user{{end}}
+    · started by {{if .Data.Run.CreatedByName.Valid}}{{.Data.Run.CreatedByName.String}}{{else if .Data.Run.EventRule}}event rule {{.Data.Run.EventRule}}{{else if .Data.Run.BySchedule}}the schedule{{else}}a removed user{{end}}
     {{if .Data.Run.CommitSHA}} · commit <span class="act">{{printf "%.10s" .Data.Run.CommitSHA}}</span>{{end}}
     {{if .Data.Run.Conn3xVersion}} · Conn3x {{.Data.Run.Conn3xVersion}}{{end}}
     {{if .Data.Run.StartedAt.Valid}} · started {{.Data.Run.StartedAt.String}}{{end}}
     {{if .Data.Run.FinishedAt.Valid}} · finished {{.Data.Run.FinishedAt.String}}{{end}}
   </p>
-  {{if .Data.Run.PlanRunID.Valid}}<p>Applies <a href="/runs/{{.Data.Run.PlanRunID.Int64}}">plan {{.Data.Run.PlanRunID.Int64}}</a>{{if .Data.Run.ApprovedAt.Valid}}, approved by {{if .Data.Run.ApprovedByName.Valid}}{{.Data.Run.ApprovedByName.String}}{{else if .Data.Run.BySchedule}}the schedule{{else}}a removed user{{end}} at {{.Data.Run.ApprovedAt.String}}{{end}}.</p>{{end}}
+  {{if .Data.Run.PlanRunID.Valid}}<p>Applies <a href="/runs/{{.Data.Run.PlanRunID.Int64}}">plan {{.Data.Run.PlanRunID.Int64}}</a>{{if .Data.Run.ApprovedAt.Valid}}, approved by {{if .Data.Run.ApprovedByName.Valid}}{{.Data.Run.ApprovedByName.String}}{{else if .Data.Run.EventRule}}event rule {{.Data.Run.EventRule}}{{else if .Data.Run.BySchedule}}the schedule{{else}}a removed user{{end}} at {{.Data.Run.ApprovedAt.String}}{{end}}.</p>{{end}}
   {{if .Data.CanCancel}}
   <form method="post" action="/runs/{{.Data.Run.ID}}/cancel" style="display:inline">
     <input type="hidden" name="csrf" value="{{.CSRF}}">

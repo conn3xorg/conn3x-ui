@@ -140,6 +140,26 @@ func (r *Runner) StartDrift(ctx context.Context, p store.Project, userID int64) 
 	return id, nil
 }
 
+// StartEvent queues a drift check of p that rule started, with the event's
+// body kept beside it, and returns the run's ID at once. It goes on to
+// correct or converge as the rule's mode says, under the same guards as a
+// schedule's.
+func (r *Runner) StartEvent(ctx context.Context, p store.Project, rule store.EventRule, body string) (int64, error) {
+	id, err := r.Store.CreateEventRun(ctx, rule, body)
+	if err != nil {
+		return 0, err
+	}
+	p.ScheduleMode = rule.Mode
+	r.wg.Go(func() {
+		r.run(id, p, func(ctx context.Context, env []string) error { return r.doDrift(ctx, id, p, env) })
+		r.notify(id, p)
+		if p.ScheduleMode == store.ModeCorrect || p.ScheduleMode == store.ModeConverge {
+			r.correct(id, p)
+		}
+	})
+	return id, nil
+}
+
 // ErrCancelled is why a run's context ended when somebody pressed Cancel.
 var ErrCancelled = errors.New("cancelled")
 

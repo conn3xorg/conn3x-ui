@@ -96,6 +96,9 @@ func New(st *store.Store, rn *run.Runner) *Server {
 	s.mux.HandleFunc("POST /projects/{id}/credentials", s.setCredential)
 	s.mux.HandleFunc("POST /projects/{id}/credentials/{name}/delete", s.deleteCredential)
 	s.mux.HandleFunc("POST /projects/{id}/roles", s.setRole)
+	s.mux.HandleFunc("POST /projects/{id}/events", s.createEventRule)
+	s.mux.HandleFunc("POST /projects/{id}/events/{rule}/delete", s.deleteEventRule)
+	s.mux.HandleFunc("POST /hooks/{id}", s.hook)
 	s.mux.HandleFunc("GET /runs", s.history)
 	s.mux.HandleFunc("GET /runs/{id}", s.runPage)
 	s.mux.HandleFunc("GET /runs/{id}/report", s.runReport)
@@ -128,6 +131,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	// An event signs in with its rule's secret, not a session.
+	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/hooks/") {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/login" || strings.HasPrefix(r.URL.Path, "/login/oidc") {
 		if r.Method == http.MethodPost && !sameToken(r.PostFormValue("csrf"), cookie(r, "csrf")) {
 			http.Error(w, "the sign-in form expired; go back and try again", http.StatusForbidden)
@@ -444,16 +452,26 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request) {
 // projectPage renders the project page with form in its settings. Only a
 // project admin gets the settings, credentials and roles.
 func (s *Server) projectPage(w http.ResponseWriter, r *http.Request, p, form store.Project, role string, status int, errMsg string) {
+	s.projectPageWith(w, r, p, form, role, status, errMsg, nil)
+}
+
+// projectPageWith is projectPage with extra data for the template.
+func (s *Server) projectPageWith(w http.ResponseWriter, r *http.Request, p, form store.Project, role string, status int, errMsg string, extra map[string]any) {
 	runs, err := s.Store.Runs(r.Context(), p.ID)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey(), "HasMail": s.Runner != nil && s.Runner.Mailer != nil}
+	d := map[string]any{"Project": p, "Form": form, "Runs": runs, "Role": role, "HasKey": s.Store.HasKey(), "HasMail": s.Runner != nil && s.Runner.Mailer != nil, "SiteAdmin": sess(r).user.Admin}
+	for k, v := range extra {
+		d[k] = v
+	}
 	if store.RoleAtLeast(role, store.RoleAdmin) {
 		if d["Credentials"], err = s.Store.Credentials(r.Context(), p.ID); err == nil {
-			if d["Members"], err = s.Store.Members(r.Context(), p.ID); err == nil {
-				d["Users"], err = s.Store.Users(r.Context())
+			if d["EventRules"], err = s.Store.EventRules(r.Context(), p.ID); err == nil {
+				if d["Members"], err = s.Store.Members(r.Context(), p.ID); err == nil {
+					d["Users"], err = s.Store.Users(r.Context())
+				}
 			}
 		}
 		if err != nil {
@@ -684,6 +702,8 @@ type runData struct {
 	CanCancel bool
 	// HasReport is true when the run is an apply that left a -report file.
 	HasReport bool
+	// Event is the body of the event that started the run, if one did.
+	Event string
 }
 
 // runAllowed loads a run, its project and the user's role on it, as
@@ -718,6 +738,12 @@ func (s *Server) loadRun(w http.ResponseWriter, r *http.Request) (runData, bool)
 	}
 	if _, err := os.Stat(s.Runner.ReportFile(d.Run.ID)); err == nil {
 		d.HasReport = true
+	}
+	if d.Run.EventRule != "" {
+		if d.Event, err = s.Store.EventBody(r.Context(), d.Run.ID); err != nil {
+			s.fail(w, err)
+			return d, false
+		}
 	}
 	d.CanCancel = !d.Run.Finished() && store.RoleAtLeast(d.Role, cancelRole(d.Run))
 	if d.Run.Kind == store.KindPlan && d.Run.Status == store.StatusSucceeded && d.Result.HasChanges() && mayApply(sess(r).user, d.Role, d.Project, d.Run) {
