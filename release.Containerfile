@@ -6,7 +6,7 @@
 # and CA certificates, which the distroless conn3x image doesn't have; its
 # conn3x binary is copied into Alpine instead. Projects can still pin
 # another conn3x by path.
-FROM ghcr.io/conn3xorg/conn3x:v0.26.0@sha256:1a52d147da29ab59f322bf860ac40de8b0a3b53d8ce763bd4eb17be07527e263 AS conn3x
+FROM ghcr.io/conn3xorg/conn3x:v0.27.0@sha256:eb05f01e583b7242d761fbca14415ccc378bfa7b2cfff79d30e695b11cb4041e AS conn3x
 
 FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN apk add --no-cache ca-certificates git openssh-client \
