@@ -8,7 +8,25 @@ This is the second slice of the design in [conn3xorg/conn3x#525](https://github.
 
 ## Install
 
-Each [release](https://github.com/conn3xorg/conn3x-ui/releases) has a binary for Linux, macOS and Windows on amd64 and arm64. Download the archive for your platform, unpack it, and put `conn3x-ui` on your PATH. It still needs `git` and a `conn3x` binary beside it.
+Since v0.4.0, conn3x-ui comes from the same package repositories as Conn3x, so one `apt upgrade`, `dnf upgrade`, `brew upgrade` or `scoop update` keeps both current. It needs `git` and a `conn3x` binary beside it, so these install Conn3x too:
+
+```sh
+# Debian and Ubuntu, after adding the Conn3x apt repository: https://docs.conn3x.org/install
+sudo apt install conn3x conn3x-ui git
+
+# Rocky Linux, RHEL, AlmaLinux and Fedora, after adding the Conn3x dnf repository
+sudo dnf install conn3x conn3x-ui git
+
+# macOS
+brew install conn3xorg/tap/conn3x
+brew install --cask conn3xorg/tap/conn3x-ui
+
+# Windows
+scoop bucket add conn3x https://github.com/conn3xorg/scoop-bucket
+scoop install conn3x/conn3x conn3x/conn3x-ui
+```
+
+The `.deb` and `.rpm` packages are signed with the Conn3x packaging key and put `conn3x-ui` in `/usr/bin`. They don't start it: how it runs is up to you, or to the circuit below. Each [release](https://github.com/conn3xorg/conn3x-ui/releases) also has a plain archive for Linux, macOS and Windows on amd64 and arm64.
 
 To install it on a server, with `conn3x`, `git` and a systemd unit, apply [circuit-conn3x-ui](https://github.com/conn3xorg/circuit-conn3x-ui).
 
@@ -458,7 +476,6 @@ To keep it somewhere else, such as a SIEM, download it from the page: **JSON lin
 The rest of the design, in the order it's planned:
 
 - Sign-in providers beyond one OIDC provider and GitHub: [#892](https://github.com/conn3xorg/conn3x/issues/892). Local accounts, OIDC sign-in, GitHub sign-in, roles per person, per OIDC group and per GitHub team, and the audit log and its export are in.
-- apt, dnf, Homebrew and Scoop packages: [#894](https://github.com/conn3xorg/conn3x/issues/894). Release binaries, the image and a circuit are in.
 
 Credentials are in, with the key from a file, a variable or a command such as a KMS decrypt, a key check at start, and rotation.
 
