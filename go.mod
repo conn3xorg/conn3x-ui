@@ -1,6 +1,6 @@
 module github.com/conn3xorg/conn3x-ui
 
-go 1.27.2
+go 1.27.4
 
 require (
 	github.com/conn3xorg/conn3x-exec v0.0.0-20261116004227-803589c0a88a
